@@ -92,3 +92,31 @@ def test_allows_when_everything_is_healthy():
     state = RiskState(day="2026-01-01", day_start_equity=100000)
     decision = mgr.can_open(state, equity=100500, account_risk=risk_snapshot())
     assert decision.allowed
+
+
+def test_check_kill_flags_bot_daily_loss():
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_kill(state, equity=97000, account_risk=risk_snapshot())
+    assert not decision.allowed
+    assert decision.flatten
+
+
+def test_check_kill_flags_room_floor():
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_kill(state, equity=100000, account_risk=risk_snapshot(daily_loss_room=100.0))
+    assert not decision.allowed
+    assert decision.flatten
+
+
+def test_can_enter_ignores_loss_but_honours_trade_limit():
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    # A large loss does not block entry by itself; that is check_kill's job.
+    assert mgr.can_enter(state, equity=90000, account_risk=risk_snapshot()).allowed
+    mgr.record_entry(state)
+    mgr.record_entry(state)
+    decision = mgr.can_enter(state, equity=100000, account_risk=risk_snapshot())
+    assert not decision.allowed
+    assert "limit" in decision.reason

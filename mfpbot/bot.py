@@ -8,7 +8,9 @@ keep exposure controlled.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -62,6 +64,9 @@ class Bot:
         # Injectable wall clock (seconds) so tests can control candle freshness.
         self.clock = time.time
         self._interval_ms = parse_interval_ms(config.timeframe)
+        # Serializes account/position/state mutation between the candle loop and
+        # the poll watchdog, which run on different threads.
+        self._lock = threading.Lock()
 
     # -- setup ------------------------------------------------------------
 
@@ -294,6 +299,18 @@ class Bot:
         equity = self._equity(account_risk)
         self.risk.roll_day(self.state.risk, equity)
 
+        # The account kill switch must run before the position branch: a
+        # bot-owned position must never stop the daily loss / room floor guard
+        # from flattening and halting.
+        kill = self.risk.check_kill(self.state.risk, equity, account_risk)
+        if not kill.allowed:
+            log.error("kill switch: %s", kill.reason)
+            if kill.flatten:
+                self._flatten()
+                self.risk.halt(self.state.risk, kill.reason)
+                save_state(self.cfg.state_file, self.state)
+            return
+
         positions = self._open_positions()
         self._prune_owned(positions)
         position = self._position_for(positions, market_id)
@@ -319,13 +336,9 @@ class Bot:
             else:
                 return
 
-        decision = self.risk.can_open(self.state.risk, equity, account_risk)
+        decision = self.risk.can_enter(self.state.risk, equity, account_risk)
         if not decision.allowed:
             log.warning("no new entry: %s", decision.reason)
-            if decision.flatten:
-                self._flatten()
-                self.risk.halt(self.state.risk, decision.reason)
-                save_state(self.cfg.state_file, self.state)
             return
 
         if signal is None:
@@ -434,6 +447,44 @@ class Bot:
             self.risk.record_entry(self.state.risk)
             save_state(self.cfg.state_file, self.state)
 
+    # -- kill-switch watchdog ---------------------------------------------
+
+    def check_kill_now(self) -> bool:
+        """Run the account kill switch once, independently of candles.
+
+        Returns True when the kill switch fired (flatten + halt). Safe to call
+        from any thread; state mutation is serialized by ``self._lock``.
+        """
+        with self._lock:
+            if self.state.risk.halted:
+                return True
+            account_risk = self._refresh_account()
+            equity = self._equity(account_risk)
+            self.risk.roll_day(self.state.risk, equity)
+            kill = self.risk.check_kill(self.state.risk, equity, account_risk)
+            if kill.allowed:
+                return False
+            log.error("watchdog kill switch: %s", kill.reason)
+            if kill.flatten:
+                self._flatten()
+                self.risk.halt(self.state.risk, kill.reason)
+                save_state(self.cfg.state_file, self.state)
+            return True
+
+    async def _watchdog(self) -> None:
+        """Poll the account between candles so guards fire even with no signal."""
+        interval = max(self.cfg.poll_seconds, 0.05)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                fired = await asyncio.to_thread(self.check_kill_now)
+            except Exception as exc:  # noqa: BLE001 - watchdog must not die
+                log.warning("watchdog check failed: %s", exc)
+                continue
+            if fired:
+                log.warning("watchdog: kill switch active; stopping checks")
+                return
+
     # -- run loop ---------------------------------------------------------
 
     def _ordered_markets(self) -> list[str]:
@@ -471,16 +522,20 @@ class Bot:
             history_limit=history,
         )
 
-        async for candle in stream.candles():
-            market_id = self._market_id_for(candle)
-            if market_id is None:
-                continue
-            try:
-                self._process_candle(market_id, candle)
-            except SystemExit:
-                return
-            except Exception as exc:  # noqa: BLE001 - one bad candle must not kill the bot
-                log.exception("%s: error handling candle %s: %s", market_id, candle.open_time, exc)
+        watchdog = asyncio.create_task(self._watchdog())
+        try:
+            async for candle in stream.candles():
+                market_id = self._market_id_for(candle)
+                if market_id is None:
+                    continue
+                try:
+                    self._process_candle(market_id, candle)
+                except SystemExit:
+                    return
+                except Exception as exc:  # noqa: BLE001 - one bad candle must not kill the bot
+                    log.exception("%s: error handling candle %s: %s", market_id, candle.open_time, exc)
+        finally:
+            watchdog.cancel()
 
     def _process_candle(self, market_id: str, candle: Candle) -> None:
         """Route one streamed candle to the series and, if fresh, the strategy.

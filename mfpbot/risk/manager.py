@@ -70,13 +70,13 @@ class RiskManager:
             state.day_start_equity = equity
         return state
 
-    def can_open(self, state: RiskState, equity: float, account_risk: dict) -> Decision:
-        if state.halted:
-            return Decision(False, state.halt_reason or "halted for the day")
+    def check_kill(self, state: RiskState, equity: float, account_risk: dict) -> Decision:
+        """Account-protecting kill switch, independent of any position.
 
-        if state.entries_today >= self.max_daily_trades:
-            return Decision(False, f"daily trade limit reached ({self.max_daily_trades})")
-
+        Runs before the per-market position branch so a bot-owned position can
+        never shield the account from the daily loss cap or a room floor. Returns
+        ``flatten=True`` when positions should be closed and the bot halted.
+        """
         start = state.day_start_equity
         if start and start > 0:
             loss_pct = max(0.0, (start - equity) / start * 100.0)
@@ -100,6 +100,26 @@ class RiskManager:
                 flatten=True,
             )
         return Decision(True)
+
+    def can_enter(self, state: RiskState, equity: float, account_risk: dict) -> Decision:
+        """Whether a new entry is allowed right now.
+
+        Only the halted flag and the daily trade-count limit live here; the
+        loss/room checks belong to :meth:`check_kill` so they also run when a
+        position is already open.
+        """
+        if state.halted:
+            return Decision(False, state.halt_reason or "halted for the day")
+        if state.entries_today >= self.max_daily_trades:
+            return Decision(False, f"daily trade limit reached ({self.max_daily_trades})")
+        return Decision(True)
+
+    def can_open(self, state: RiskState, equity: float, account_risk: dict) -> Decision:
+        """Combined check: kill switch first, then entry permission."""
+        kill = self.check_kill(state, equity, account_risk)
+        if not kill.allowed:
+            return kill
+        return self.can_enter(state, equity, account_risk)
 
     def record_entry(self, state: RiskState) -> None:
         state.entries_today += 1

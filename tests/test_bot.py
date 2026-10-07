@@ -7,6 +7,7 @@ import pytest
 from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
+from mfpbot.risk.manager import _utc_day
 from mfpbot.state import BotState, load_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
 
@@ -240,6 +241,61 @@ def test_stale_quote_skips_entry(stub_server, tmp_path):
     )
     bot.on_closed_candle("binance|BTCUSDT", bot.series["binance|BTCUSDT"].closed[-1])
     assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_kill_switch_runs_while_holding_a_position(stub_server, tmp_path):
+    """A bot-owned position must not shield the account from the daily kill switch."""
+    bot, state = build_bot(stub_server, tmp_path)
+    state.positions = [{
+        "id": "pos-own", "account_id": "acct-1", "market_id": "binance|BTCUSDT",
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    bot.state.owned_position_ids = ["pos-own"]
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    candle = feed(bot, "binance|BTCUSDT", [100.0] * 12)  # no crossover
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+    assert bot.state.risk.halted
+
+
+def test_watchdog_flattens_without_a_new_candle(stub_server, tmp_path):
+    """The poll watchdog enforces the kill switch between candles."""
+    import asyncio
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.05)
+    state.positions = [{
+        "id": "pos-own", "account_id": "acct-1", "market_id": "binance|BTCUSDT",
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    bot.state.owned_position_ids = ["pos-own"]
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        for _ in range(200):
+            if bot.state.risk.halted:
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert bot.state.risk.halted
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
 
 
 def test_history_replay_is_not_traded(stub_server, tmp_path):
