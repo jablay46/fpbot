@@ -8,7 +8,7 @@ from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
 from mfpbot.risk.manager import _utc_day
-from mfpbot.state import BotState, load_state
+from mfpbot.state import BotState, PendingEntry, load_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
 
 # Downtrend that turns up: bullish EMA cross on the final candle.
@@ -241,6 +241,83 @@ def test_stale_quote_skips_entry(stub_server, tmp_path):
     )
     bot.on_closed_candle("binance|BTCUSDT", bot.series["binance|BTCUSDT"].closed[-1])
     assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def _feed_fresh_cross(bot, market_id, closes, *, now_ms):
+    symbol = bot.markets[market_id]["coin"]
+    start = now_ms - len(closes) * 60_000
+    candles = make_candles(closes, start_time=start, symbol=symbol)
+    for candle in candles:
+        bot._process_candle(market_id, candle)
+
+
+def test_lost_order_response_is_reconciled(stub_server, tmp_path):
+    """An order accepted but with a lost reply must still be owned and counted."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    # The client may retry the POST; the exchange must still create one order.
+    assert len(state.orders) == 1
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.owned_position_ids == ["pos-1"]
+    assert bot.state.pending_entry is None
+
+
+def test_unknown_order_blocks_entry_without_duplicate(stub_server, tmp_path):
+    """When the reply and the lookup both fail, block the market, never re-order."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert len(state.orders) == 1
+    assert bot.state.pending_entry is not None
+    assert bot.state.risk.entries_today == 0
+    assert bot.state.owned_position_ids == []
+
+    # A later signal in the same market must not fire a second order.
+    now2 = now_ms + 60_000
+    bot.clock = lambda: now2 / 1000.0
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(DOWN_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now2
+    )
+    assert len(state.orders) == 1
+
+
+def test_pending_entry_is_reconciled_on_later_candle(stub_server, tmp_path):
+    """Once the lookup recovers, a pending entry is adopted exactly once."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 10  # exhaust the client's retries this candle
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert bot.state.pending_entry is not None
+    assert bot.state.risk.entries_today == 0
+
+    # The lookup recovers; the next candle reconciles the outstanding entry.
+    state.fail_order_lookup_times = 0
+    now2 = now_ms + 60_000
+    bot.clock = lambda: now2 / 1000.0
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now2
+    )
+
+    assert len(state.orders) == 1
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.owned_position_ids == ["pos-1"]
+    assert bot.state.pending_entry is None
 
 
 def test_kill_switch_runs_while_holding_a_position(stub_server, tmp_path):

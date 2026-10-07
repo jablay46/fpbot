@@ -20,7 +20,7 @@ from .config import Config
 from .market_stream import Candle, CandleSeries, MarketDataStream
 from .risk.manager import RiskManager, RiskState
 from .risk.sizing import PositionSizer
-from .state import BotState, load_state, save_state
+from .state import BotState, PendingEntry, load_state, save_state
 from .strategy import build_strategy
 from .util import fmt, parse_interval_ms
 
@@ -144,6 +144,7 @@ class Bot:
         self, market_id: str, side: str, size: float, entry: float, stop: float, tp: float
     ) -> Optional[dict[str, Any]]:
         client_order_id = f"mfpbot:{market_id}:{uuid.uuid4().hex[:12]}"
+        idempotency_key = self.client.new_idempotency_key()
         order = {
             "client_order_id": client_order_id,
             "type": "market",
@@ -164,25 +165,108 @@ class Bot:
             )
             return {"id": "dry-run", "status": "filled", "client_order_id": client_order_id}
 
-        try:
-            created = self.client.place_order(order)
-        except ApiError as exc:
-            log.error("%s: order rejected: %s (code=%s rule=%s)", market_id, exc, exc.code, exc.details)
-            return None
-
+        # Record the intent (and the positions we must not mistake for ours)
+        # before sending, so a lost reply or crash can be reconciled later.
+        pending = PendingEntry(
+            market_id=market_id,
+            client_order_id=client_order_id,
+            idempotency_key=idempotency_key,
+            sent_at=self.clock(),
+            pre_position_ids=self._market_position_ids(market_id),
+        )
+        self.state.pending_entry = pending
         self.state.last_entry_client_order_id = client_order_id
+        save_state(self.cfg.state_file, self.state)
+
+        try:
+            created = self.client.place_order(order, idempotency_key=idempotency_key)
+        except ApiError as exc:
+            return self._recover_lost_order(market_id, pending, exc)
+
+        return self._finish_entry(market_id, created, pending)
+
+    def _recover_lost_order(
+        self, market_id: str, pending: PendingEntry, exc: ApiError
+    ) -> Optional[dict[str, Any]]:
+        """Resolve an order whose reply was lost instead of assuming it failed."""
+        log.warning("%s: order response lost (%s); reconciling by client_order_id", market_id, exc)
+        try:
+            found = self.client.find_order_by_client_id(pending.client_order_id)
+        except ApiError as lookup_exc:
+            log.error(
+                "%s: cannot confirm order %s (%s); blocking new entries in this market",
+                market_id, pending.client_order_id, lookup_exc,
+            )
+            # Keep pending_entry so the next candle / watchdog retries the lookup.
+            save_state(self.cfg.state_file, self.state)
+            return None
+        if found is None:
+            log.warning("%s: order %s was not accepted; treating as not sent", market_id, pending.client_order_id)
+            self.state.pending_entry = None
+            save_state(self.cfg.state_file, self.state)
+            return None
+        log.info("%s: reconciled order %s after a lost reply", market_id, pending.client_order_id)
+        return self._finish_entry(market_id, found, pending)
+
+    def _finish_entry(
+        self, market_id: str, created: dict[str, Any], pending: PendingEntry
+    ) -> Optional[dict[str, Any]]:
+        """Await the fill, adopt the position, and clear the pending marker."""
         filled = self._await_order(market_id, created)
         if filled is not None:
-            self._adopt_position(market_id)
+            self._adopt_position(market_id, pending.pre_position_ids)
+        self.state.pending_entry = None
+        save_state(self.cfg.state_file, self.state)
         return filled
 
-    def _adopt_position(self, market_id: str, timeout: float = 8.0) -> None:
+    def _reconcile_pending_entry(self) -> bool:
+        """Resolve an outstanding entry from a previous send. Returns True if busy.
+
+        Blocks new entries in that market until the outcome is known so a lost
+        order can never be duplicated.
+        """
+        pending = self.state.pending_entry
+        if pending is None:
+            return False
+        try:
+            found = self.client.find_order_by_client_id(pending.client_order_id)
+        except ApiError as exc:
+            log.warning(
+                "%s: still cannot confirm pending entry %s (%s); skipping new entries",
+                pending.market_id, pending.client_order_id, exc,
+            )
+            return True
+        if found is None:
+            log.info("%s: pending entry %s was never accepted; clearing", pending.market_id, pending.client_order_id)
+            self.state.pending_entry = None
+            save_state(self.cfg.state_file, self.state)
+            return False
+        log.info("%s: resolving pending entry %s", pending.market_id, pending.client_order_id)
+        filled = self._finish_entry(pending.market_id, found, pending)
+        if filled is not None:
+            self.risk.record_entry(self.state.risk)
+            save_state(self.cfg.state_file, self.state)
+        return True
+
+    def _market_position_ids(self, market_id: str) -> list[str]:
+        """IDs of currently open positions in one market (pre-entry snapshot)."""
+        try:
+            return [p["id"] for p in self._open_positions() if p.get("market_id") == market_id]
+        except ApiError as exc:
+            log.warning("%s: could not snapshot positions before entry: %s", market_id, exc)
+            return []
+
+    def _adopt_position(
+        self, market_id: str, pre_position_ids: Optional[list[str]] = None, timeout: float = 8.0
+    ) -> None:
         """Link the position our fill created so the bot manages it.
 
         Entry orders do not return a position_id, so match the freshly opened
-        position on this market. Markets with a pre-existing manual position are
-        skipped before entry, so any new position here is ours.
+        position on this market. Only positions that did not exist before the
+        order are ours, which keeps a lagging closed position (reversal) or a
+        manual position from being mis-adopted.
         """
+        pre = set(pre_position_ids or [])
         deadline = time.monotonic() + timeout
         delay = 0.5
         while time.monotonic() < deadline:
@@ -192,7 +276,11 @@ class Bot:
                 log.warning("%s: could not adopt position: %s", market_id, exc)
                 return
             for pos in positions:
-                if pos.get("market_id") == market_id and pos["id"] not in self.state.owned_position_ids:
+                if (
+                    pos.get("market_id") == market_id
+                    and pos["id"] not in pre
+                    and pos["id"] not in self.state.owned_position_ids
+                ):
                     self._remember_position(pos["id"])
                     log.info("%s: adopted position %s (%s)", market_id, pos["id"], pos.get("side"))
                     save_state(self.cfg.state_file, self.state)
@@ -311,6 +399,9 @@ class Bot:
                 save_state(self.cfg.state_file, self.state)
             return
 
+        # Resolve any entry left unconfirmed by a lost reply before acting.
+        self._reconcile_pending_entry()
+
         positions = self._open_positions()
         self._prune_owned(positions)
         position = self._position_for(positions, market_id)
@@ -342,6 +433,10 @@ class Bot:
             return
 
         if signal is None:
+            return
+
+        if self.state.pending_entry is not None and self.state.pending_entry.market_id == market_id:
+            log.warning("%s: an unconfirmed entry is still pending; not opening another", market_id)
             return
 
         if self._margin_headroom(positions, equity) <= 0:
@@ -458,6 +553,7 @@ class Bot:
         with self._lock:
             if self.state.risk.halted:
                 return True
+            self._reconcile_pending_entry()
             account_risk = self._refresh_account()
             equity = self._equity(account_risk)
             self.risk.roll_day(self.state.risk, equity)
@@ -498,6 +594,8 @@ class Bot:
         self.resolve_account()
         self.resolve_markets()
         self.risk = self._build_risk_manager()
+        # A restart may leave an entry unconfirmed; resolve it before trading.
+        self._reconcile_pending_entry()
 
         log.info(
             "starting multi-asset bot: account=%s (%s) markets=%d strategy=%s timeframe=%s env=%s dry_run=%s",

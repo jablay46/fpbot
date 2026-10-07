@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from mfpbot.risk.manager import RiskState
-from mfpbot.state import BotState, load_state, save_state
+from mfpbot.state import BotState, PendingEntry, load_state, save_state
 
 
 def test_save_and_load_round_trip(tmp_path):
@@ -54,3 +54,17 @@ def test_owned_position_ids_round_trip(tmp_path):
     path = tmp_path / "state.json"
     save_state(path, BotState(owned_position_ids=["pos-1", "pos-2"]))
     assert load_state(path).owned_position_ids == ["pos-1", "pos-2"]
+
+
+def test_pending_entry_round_trip(tmp_path):
+    path = tmp_path / "state.json"
+    pending = PendingEntry(
+        market_id="binance|BTCUSDT",
+        client_order_id="mfpbot:x:1",
+        idempotency_key="key-1",
+        sent_at=1.5,
+        pre_position_ids=["pos-old"],
+    )
+    save_state(path, BotState(pending_entry=pending))
+    loaded = load_state(path)
+    assert loaded.pending_entry == pending

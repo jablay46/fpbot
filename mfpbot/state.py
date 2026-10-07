@@ -15,12 +15,42 @@ log = logging.getLogger("mfpbot.state")
 
 
 @dataclass
+class PendingEntry:
+    """An entry order that was sent but whose outcome is not yet confirmed.
+
+    Persisted before the request so a lost reply (or a crash mid-send) can be
+    reconciled by client_order_id instead of being assumed failed.
+    """
+
+    market_id: str
+    client_order_id: str
+    idempotency_key: str
+    sent_at: float
+    pre_position_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PendingEntry":
+        return cls(
+            market_id=str(data["market_id"]),
+            client_order_id=str(data["client_order_id"]),
+            idempotency_key=str(data.get("idempotency_key") or ""),
+            sent_at=float(data.get("sent_at") or 0.0),
+            pre_position_ids=[str(p) for p in data.get("pre_position_ids") or []],
+        )
+
+
+@dataclass
 class BotState:
     risk: RiskState = field(default_factory=RiskState)
     last_processed_open_time: dict[str, int] = field(default_factory=dict)
     last_entry_client_order_id: Optional[str] = None
     # Positions opened by this bot, so it never touches manual positions.
     owned_position_ids: list[str] = field(default_factory=list)
+    # An entry order awaiting confirmation; blocks new entries in its market.
+    pending_entry: Optional[PendingEntry] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -36,11 +66,14 @@ class BotState:
             # None or a legacy scalar cursor from the single-market format.
             last = {}
         owned = data.get("owned_position_ids") or []
+        raw_pending = data.get("pending_entry")
+        pending = PendingEntry.from_dict(raw_pending) if isinstance(raw_pending, dict) else None
         return cls(
             risk=risk,
             last_processed_open_time=last,
             last_entry_client_order_id=data.get("last_entry_client_order_id"),
             owned_position_ids=[str(p) for p in owned],
+            pending_entry=pending,
         )
 
 

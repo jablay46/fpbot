@@ -100,9 +100,10 @@ class StubState:
     risk: dict[str, Any] = field(default_factory=lambda: risk_snapshot())
     order_status: str = "filled"
     account_status: str = "active"
-    # Number of times to drop a POST /v1/orders response after recording the
-    # order, simulating the order being accepted but the reply lost.
-    drop_order_response_times: int = 0
+    # When true, drop every POST /v1/orders response after recording the order,
+    # simulating the order being accepted but the reply lost (client retries all
+    # fail too).
+    drop_order_response: bool = False
     # Number of GET /v1/orders responses to answer 503 (lookup also failing).
     fail_order_lookup_times: int = 0
     # Number of extra polls during which a closed position still appears open.
@@ -219,34 +220,43 @@ class _Handler(BaseHTTPRequestHandler):
                 (o for o in self.state.orders if o.get("client_order_id") == order.get("client_order_id")),
                 None,
             )
-            if existing is not None:
-                self._send(201, {"data": existing})
+            if existing is None:
+                seq = len(self.state.orders) + 1
+                position_id = f"pos-{seq}"
+                order.update({"id": f"order-{seq}", "status": self.state.order_status,
+                              "filled_size": (body or {}).get("size"),
+                              "position_id": position_id})
+                self.state.orders.append(order)
+                # Mirror the live API: a filled entry opens a position, which the
+                # bot must then discover and adopt by market id.
+                if self.state.order_status == "filled":
+                    self.state.positions.append({
+                        "id": position_id, "account_id": order.get("account_id", "acct-1"),
+                        "market_id": order.get("market_id"), "provider": "binance",
+                        "symbol": order.get("market_id", "").split("|")[-1][:3],
+                        "coin": order.get("market_id", "").split("|")[-1],
+                        "side": "long" if order.get("side") == "buy" else "short",
+                        "size": order.get("size"), "entry_price": order.get("expected_price") or 100.0,
+                        "leverage": order.get("leverage") or 2.0,
+                        "margin_mode": order.get("margin_mode", "cross"),
+                        "status": "open", "opened_at": seq,
+                    })
+                existing = order
+            if self.state.drop_order_response:
+                # The order was accepted (and recorded) but every reply is lost,
+                # so the client exhausts its retries and raises.
                 return
-            seq = len(self.state.orders) + 1
-            position_id = f"pos-{seq}"
-            order.update({"id": f"order-{seq}", "status": self.state.order_status,
-                          "filled_size": (body or {}).get("size"),
-                          "position_id": position_id})
-            self.state.orders.append(order)
-            # Mirror the live API: a filled entry opens a position, which the
-            # bot must then discover and adopt by market id.
-            if self.state.order_status == "filled":
-                self.state.positions.append({
-                    "id": position_id, "account_id": order.get("account_id", "acct-1"),
-                    "market_id": order.get("market_id"), "provider": "binance",
-                    "symbol": order.get("market_id", "").split("|")[-1][:3],
-                    "coin": order.get("market_id", "").split("|")[-1],
-                    "side": "long" if order.get("side") == "buy" else "short",
-                    "size": order.get("size"), "entry_price": order.get("expected_price") or 100.0,
-                    "leverage": order.get("leverage") or 2.0,
-                    "margin_mode": order.get("margin_mode", "cross"),
-                    "status": "open", "opened_at": seq,
-                })
-            if self.state.drop_order_response_times > 0:
-                # The order was accepted (and recorded) but the reply is lost.
-                self.state.drop_order_response_times -= 1
+            self._send(201, {"data": existing})
+        elif path == "/v1/orders" and method == "GET":
+            if self.state.fail_order_lookup_times > 0:
+                self.state.fail_order_lookup_times -= 1
+                self._send(503, {"error": {"code": "unavailable", "message": "try later"}})
                 return
-            self._send(201, {"data": order})
+            rows = list(self.state.orders)
+            wanted = query.get("client_order_id", [None])[0]
+            if wanted:
+                rows = [o for o in rows if o.get("client_order_id") == wanted]
+            self._send(200, {"data": rows})
         elif path.startswith("/v1/orders/"):
             order_id = path.rsplit("/", 1)[-1]
             if self.state.fail_order_lookup_times > 0:
