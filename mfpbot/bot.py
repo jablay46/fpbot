@@ -106,6 +106,7 @@ class Bot:
             max_daily_loss_pct=self.cfg.max_daily_loss_pct,
             min_daily_room_pct=self.cfg.min_daily_room_pct,
             starting_balance=starting,
+            missing_room_policy=self.cfg.missing_room_policy,
         )
 
     # -- helpers ----------------------------------------------------------

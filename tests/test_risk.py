@@ -47,8 +47,39 @@ def test_sizing_caps_leverage_at_market_max():
     assert result.leverage == 5.0
 
 
-def _manager() -> RiskManager:
-    return RiskManager(max_daily_trades=2, max_daily_loss_pct=2.0, min_daily_room_pct=0.5, starting_balance=100000)
+def _manager(**overrides) -> RiskManager:
+    kwargs = dict(max_daily_trades=2, max_daily_loss_pct=2.0, min_daily_room_pct=0.5, starting_balance=100000)
+    kwargs.update(overrides)
+    return RiskManager(**kwargs)
+
+
+def test_missing_room_halt_blocks_entry_without_flatten():
+    mgr = _manager(missing_room_policy="halt")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.can_enter(
+        state, equity=100000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    )
+    assert not decision.allowed
+    assert not decision.flatten
+
+
+def test_missing_room_bot_only_allows_entry():
+    mgr = _manager(missing_room_policy="bot-only")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.can_enter(
+        state, equity=100000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    )
+    assert decision.allowed
+
+
+def test_missing_room_halt_still_flags_bot_loss():
+    mgr = _manager(missing_room_policy="halt")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_kill(
+        state, equity=97000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    )
+    assert not decision.allowed
+    assert decision.flatten
 
 
 def test_daily_loss_cap_halts_and_flags_flatten():

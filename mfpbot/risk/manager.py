@@ -11,9 +11,12 @@ Two layers protect the account:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+log = logging.getLogger("mfpbot.risk")
 
 
 def _utc_day(now: Optional[datetime] = None) -> str:
@@ -27,6 +30,8 @@ class RiskState:
     entries_today: int = 0
     halted: bool = False
     halt_reason: str = ""
+    # Day the "account room missing" warning was last logged (once per day).
+    missing_room_warned_day: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,11 +57,39 @@ class RiskManager:
         max_daily_loss_pct: float,
         min_daily_room_pct: float,
         starting_balance: float,
+        missing_room_policy: str = "bot-only",
     ) -> None:
         self.max_daily_trades = max_daily_trades
         self.max_daily_loss_pct = max_daily_loss_pct
         self.min_daily_room_pct = min_daily_room_pct
         self.starting_balance = starting_balance
+        # "halt": a null room is treated as a hard stop (fail closed).
+        # "bot-only": continue with bot-side caps and warn once per day.
+        self.missing_room_policy = missing_room_policy
+
+    def _room_available(self, state: RiskState, account_risk: dict) -> bool:
+        """False when the account reports no usable room and the policy is halt.
+
+        A competition account can report ``daily_loss_room`` / ``max_drawdown_room``
+        as null. Fail closed unless the operator opted into bot-only limits.
+        """
+        if self.missing_room_policy != "halt":
+            if self.missing_room_policy == "bot-only" and state.missing_room_warned_day != state.day:
+                log.warning(
+                    "account risk snapshot has no room figures; relying on bot-side caps only"
+                )
+                state.missing_room_warned_day = state.day
+            return True
+        daily_room = account_risk.get("daily_loss_room")
+        dd_room = account_risk.get("max_drawdown_room")
+        if daily_room is None or dd_room is None:
+            log.error(
+                "account risk snapshot is missing room figures (daily_loss_room=%s, "
+                "max_drawdown_room=%s); refusing new entries (FP_ON_MISSING_ROOM=halt)",
+                daily_room, dd_room,
+            )
+            return False
+        return True
 
     def roll_day(self, state: RiskState, equity: float, now: Optional[datetime] = None) -> RiskState:
         today = _utc_day(now)
@@ -112,6 +145,8 @@ class RiskManager:
             return Decision(False, state.halt_reason or "halted for the day")
         if state.entries_today >= self.max_daily_trades:
             return Decision(False, f"daily trade limit reached ({self.max_daily_trades})")
+        if not self._room_available(state, account_risk):
+            return Decision(False, "account risk snapshot has no room figures (fail closed)")
         return Decision(True)
 
     def can_open(self, state: RiskState, equity: float, account_risk: dict) -> Decision:

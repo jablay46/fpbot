@@ -54,6 +54,32 @@ def test_bool_coercion():
     assert cfg.dry_run is True
 
 
+def test_on_missing_room_defaults_to_bot_only_in_sandbox():
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_ENV": "sandbox"}, require_key=True)
+    assert cfg.missing_room_policy == "bot-only"
+
+
+def test_on_missing_room_defaults_to_halt_in_live():
+    cfg = load_config(env={"FP_API_KEY": "fp_live_abc", "FP_ENV": "live"}, require_key=True)
+    assert cfg.missing_room_policy == "halt"
+
+
+def test_on_missing_room_explicit_override():
+    cfg = load_config(
+        env={"FP_API_KEY": "fp_test_abc", "FP_ENV": "sandbox", "FP_ON_MISSING_ROOM": "halt"},
+        require_key=True,
+    )
+    assert cfg.missing_room_policy == "halt"
+
+
+def test_on_missing_room_invalid_rejected():
+    with pytest.raises(ConfigError):
+        load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_ON_MISSING_ROOM": "whatever"},
+            require_key=True,
+        )
+
+
 def test_config_file_and_env_precedence(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"risk_per_trade_pct": 2.0, "ema_fast": 3}), encoding="utf-8")

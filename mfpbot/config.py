@@ -53,6 +53,8 @@ class Config:
     max_margin_pct: float = 50.0
     # "bot" closes only positions this bot opened; "account" closes everything.
     flatten_scope: str = "bot"
+    # "halt" or "bot-only"; empty means choose by environment (live -> halt).
+    on_missing_room: str = ""
 
     poll_seconds: float = 15.0
     log_level: str = "INFO"
@@ -74,6 +76,16 @@ class Config:
     @property
     def market_stream_url(self) -> str:
         return MARKET_STREAM_URL
+
+    @property
+    def missing_room_policy(self) -> str:
+        """Effective policy when the account risk snapshot has null room figures.
+
+        Defaults to ``halt`` on live (fail closed) and ``bot-only`` on sandbox.
+        """
+        if self.on_missing_room:
+            return self.on_missing_room
+        return "halt" if self.environment == "live" else "bot-only"
 
     @property
     def market_ids(self) -> list[str]:
@@ -126,6 +138,8 @@ class Config:
             raise ConfigError("FP_MAX_DAILY_LOSS_PCT must be greater than zero.")
         if self.flatten_scope not in {"bot", "account"}:
             raise ConfigError("FP_FLATTEN_SCOPE must be 'bot' or 'account'.")
+        if self.on_missing_room and self.on_missing_room not in {"halt", "bot-only"}:
+            raise ConfigError("FP_ON_MISSING_ROOM must be 'halt' or 'bot-only'.")
         if not 0 < self.max_margin_pct <= 100:
             raise ConfigError("FP_MAX_MARGIN_PCT must be between 0 and 100.")
         if self.poll_seconds <= 0:
@@ -154,6 +168,7 @@ _ENV_KEYS = {
     "min_daily_room_pct": "FP_MIN_DAILY_ROOM_PCT",
     "max_margin_pct": "FP_MAX_MARGIN_PCT",
     "flatten_scope": "FP_FLATTEN_SCOPE",
+    "on_missing_room": "FP_ON_MISSING_ROOM",
     "poll_seconds": "FP_POLL_SECONDS",
     "log_level": "FP_LOG_LEVEL",
     "state_file": "FP_STATE_FILE",
