@@ -2,9 +2,10 @@
 
 A small, dependency-light Python bot that trades the MyFundedPerps
 (myfundedperpetuals.com) developer API. It streams live market data over
-WebSocket, evaluates an EMA-crossover strategy on closed candles, sizes each
-position from a fixed risk budget, and manages the trade with a broker-side
-take-profit and stop-loss.
+WebSocket for **many assets at once** (crypto, stocks, indices, commodities,
+forex), evaluates an EMA-crossover strategy on closed candles per market, sizes
+each position from a fixed risk budget, and manages the trade with a
+broker-side take-profit and stop-loss.
 
 > Status: the MyFundedPerps developer API is in **beta**. Endpoints and fields
 > may change. This bot is a working reference, not a production trading system.
@@ -45,7 +46,8 @@ Key settings (see `.env.example` for all of them):
 | `FP_API_KEY` | Sandbox (`fp_test_`) or live (`fp_live_`) API key |
 | `FP_ENV` | `sandbox` (default) or `live` |
 | `FP_ACCOUNT_ID` | Challenge account to trade; empty = first active account |
-| `FP_MARKET_ID` | Market to trade, e.g. `binance|BTCUSDT` |
+| `FP_SYMBOLS` | Comma-separated market IDs to trade (multi-asset). Max 32 |
+| `FP_MARKET_ID` | Single market fallback used when `FP_SYMBOLS` is empty |
 | `FP_TIMEFRAME` | Candle interval, e.g. `15m` |
 | `FP_RISK_PER_PCT` | Percent of equity risked between entry and stop |
 | `FP_ATR_STOP_MULT` | Stop distance as a multiple of ATR |
@@ -74,6 +76,37 @@ python -m mfpbot run
 # Show open positions
 python -m mfpbot positions
 ```
+
+## Multi-asset trading
+
+Set `FP_SYMBOLS` to a comma-separated list of market IDs to trade many assets
+in one run:
+
+```bash
+FP_SYMBOLS=binance|BTCUSDT,binance|ETHUSDT,binance|SOLUSDT,binance|XRPUSDT,\
+hyperliquid|xyz:AAPL,hyperliquid|xyz:SP500,binance|XAUUSDT,hyperliquid|xyz:EUR
+```
+
+The catalog spans five asset classes (all perpetuals): crypto (`binance|*USDT`),
+stocks (`hyperliquid|xyz:AAPL`, `xyz:MSFT`, …), indices (`xyz:SP500`,
+`xyz:XYZ100`, `xyz:JP225`), commodities (`binance|XAUUSDT`, `xyz:GOLD`,
+`xyz:SILVER`, `binance|NATGASUSDT`, `binance|CLUSDT`), and forex (`xyz:EUR`,
+`xyz:JPY`). Run `python -m mfpbot markets` to list every valid ID.
+
+How it works:
+
+* All markets share **one WebSocket connection**, but subscriptions are grouped
+  **per provider** (`binance` vs `hyperliquid`). A subscription that lists
+  several providers resolves its symbols against the first provider, so mixing
+  venues in one frame is rejected as an unknown market; grouping avoids that.
+* The strategy runs independently per market. One position per market; a signal
+  in one market never blocks another.
+* Portfolio-level daily guards are shared: `FP_MAX_DAILY_TRADES` counts entries
+  across all markets, and the daily-loss / drawdown checks use account equity.
+* Position sizing subtracts margin already reserved by other open positions, so
+  concurrent entries do not over-commit the account.
+* When several signals land on the same candle, markets are processed in a
+  rotating order so none starves the others.
 
 ## Strategy
 
@@ -134,6 +167,29 @@ mfpbot/
   risk/             sizing + daily/account guards
   state.py          persisted state
 ```
+
+## Going live safely
+
+The bot can trade a live challenge account, but go in this order:
+
+1. Set `FP_ENV=sandbox` with a `fp_test_` key and confirm signals and orders on
+   the free sandbox account first.
+2. Run live with `FP_DRY_RUN=true` to see the intended entries against real
+   quotes without sending orders.
+3. Start live with **one** market, small `FP_RISK_PER_PCT` (e.g. `0.25`), and a
+   low `FP_MAX_DAILY_TRADES`.
+4. Only then widen `FP_SYMBOLS` and risk.
+
+Sizing uses the account risk snapshot, so a live challenge account's daily-loss
+and max-drawdown floors are respected. The bot still cannot guarantee profit;
+challenge rules can fail the account on a bad day.
+
+### Loading the API key
+
+Put the key directly in `.env` (`FP_API_KEY=...`); `.env` is git-ignored and the
+bot never logs it. If you receive the key in a text file, paste just the key
+value into `.env` and delete the text file. Never commit the key or paste it
+into chat.
 
 ## Security
 

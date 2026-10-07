@@ -120,36 +120,66 @@ class CandleSeries:
 
 
 class MarketDataStream:
-    """Reconnecting async generator over the public market-data WebSocket."""
+    """Reconnecting async generator over the public market-data WebSocket.
+
+    Subscriptions are grouped by provider: each group is one ``sub`` frame.
+    Grouping matters because a subscription that lists several providers
+    resolves its symbols against the first provider, so mixing a venue's
+    symbols with another venue's provider is rejected as an unknown market.
+    One WebSocket connection can carry several groups.
+    """
 
     def __init__(
         self,
         url: str,
         *,
-        symbols: list[str],
-        providers: list[str] | None = None,
+        groups: list[dict],
         interval: str = "15m",
         history_limit: int = 300,
         max_backoff: float = 60.0,
     ) -> None:
-        if not 1 <= len(symbols) <= 32:
-            raise ValueError("symbols must contain 1 to 32 entries")
+        if not groups:
+            raise ValueError("at least one subscription group is required")
+        for group in groups:
+            symbols = group.get("symbols") or []
+            if not 1 <= len(symbols) <= 32:
+                raise ValueError("each group must contain 1 to 32 symbols")
         self.url = url
-        self.symbols = symbols
-        self.providers = providers or []
+        self.groups = groups
         self.interval = interval
         self.history_limit = history_limit
         self.max_backoff = max_backoff
 
-    def _subscribe_frame(self, request_id: int) -> str:
-        payload: dict = {"symbols": self.symbols, "intervals": [self.interval], "historyLimit": self.history_limit}
-        if self.providers:
-            payload["providers"] = self.providers
+    @classmethod
+    def for_markets(
+        cls,
+        url: str,
+        markets: list[dict],
+        *,
+        interval: str = "15m",
+        history_limit: int = 300,
+        max_backoff: float = 60.0,
+    ) -> "MarketDataStream":
+        """Build one subscription group per provider from market catalog rows."""
+        by_provider: dict[str, list[str]] = {}
+        for market in markets:
+            provider = market["provider"]
+            coin = market["coin"]
+            bucket = by_provider.setdefault(provider, [])
+            if coin not in bucket:
+                bucket.append(coin)
+        groups = [{"symbols": coins, "providers": [provider]} for provider, coins in by_provider.items()]
+        return cls(url, groups=groups, interval=interval, history_limit=history_limit, max_backoff=max_backoff)
+
+    def _subscribe_frame(self, request_id: int, group: dict) -> str:
+        payload: dict = {"symbols": group["symbols"], "intervals": [self.interval], "historyLimit": self.history_limit}
+        if group.get("providers"):
+            payload["providers"] = group["providers"]
         return json.dumps({"op": "sub", "id": request_id, "channel": "candles", "payload": payload})
 
     async def candles(self) -> AsyncIterator[Candle]:
         """Yield candle events forever, reconnecting on transport failures."""
-        request_id = 1
+        next_id = 1
         backoff = 1.0
         while True:
             try:
@@ -160,10 +190,12 @@ class MarketDataStream:
                     ping_timeout=20,
                     max_size=2 * 1024 * 1024,
                 ) as ws:
-                    await ws.send(self._subscribe_frame(request_id))
-                    request_id += 1
+                    for group in self.groups:
+                        await ws.send(self._subscribe_frame(next_id, group))
+                        next_id += 1
                     backoff = 1.0
-                    log.info("market stream connected (%s %s)", self.symbols, self.interval)
+                    log.info("market stream connected (%d subscription group(s), %s)",
+                             len(self.groups), self.interval)
                     async for raw in ws:
                         frame = json.loads(raw)
                         op = frame.get("op")

@@ -60,11 +60,18 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"API: {info.get('name')} {info.get('version')} ({info.get('environment')})")
     accounts = client.list_accounts()
     print(f"Authenticated. {len(accounts)} account(s) accessible.")
-    market = client.get_market(cfg.market_id)
-    print(f"Market {cfg.market_id}: coin={market.get('coin')} provider={market.get('provider')} "
-          f"max_leverage={market.get('max_leverage')}")
-    quote = client.get_quote(cfg.market_id, side="buy", size=float(market.get("min_size") or 1))
-    print(f"Quote mid={fmt(quote.get('mid'))} fillable={quote.get('fillable')}")
+    catalog = {m["market_id"]: m for m in client.list_markets()}
+    print(f"Configured markets ({len(cfg.market_ids)}):")
+    for mid in cfg.market_ids:
+        market = catalog.get(mid)
+        if market is None:
+            print(f"  {mid}: NOT TRADABLE")
+            continue
+        quote = client.get_quote(mid)
+        print(
+            f"  {mid}: provider={market.get('provider')} max_leverage={market.get('max_leverage')} "
+            f"mid={fmt(quote.get('mid'))}"
+        )
     return 0
 
 

@@ -33,6 +33,7 @@ class Config:
     environment: str = "sandbox"
     account_id: str = ""
     market_id: str = "binance|BTCUSDT"
+    symbols: list[str] = field(default_factory=list)
 
     strategy: str = "ema_cross"
     timeframe: str = "15m"
@@ -70,6 +71,13 @@ class Config:
     def market_stream_url(self) -> str:
         return MARKET_STREAM_URL
 
+    @property
+    def market_ids(self) -> list[str]:
+        """Effective list of market IDs to trade (multi-asset)."""
+        if self.symbols:
+            return list(self.symbols)
+        return [self.market_id]
+
     def validate(self, *, require_key: bool = True) -> None:
         if require_key:
             if not self.api_key:
@@ -92,6 +100,16 @@ class Config:
             )
         if "|" not in self.market_id:
             raise ConfigError("FP_MARKET_ID must look like 'provider|COIN', e.g. 'binance|BTCUSDT'.")
+        market_ids = self.market_ids
+        if not market_ids:
+            raise ConfigError("At least one market is required (FP_SYMBOLS or FP_MARKET_ID).")
+        if len(market_ids) > 32:
+            raise ConfigError("At most 32 markets can be streamed on one connection.")
+        if len(set(market_ids)) != len(market_ids):
+            raise ConfigError("FP_SYMBOLS contains duplicate market IDs.")
+        for mid in market_ids:
+            if "|" not in mid:
+                raise ConfigError(f"market ID {mid!r} must look like 'provider|COIN'.")
         if self.ema_fast >= self.ema_slow:
             raise ConfigError("FP_EMA_FAST must be smaller than FP_EMA_SLOW.")
         if self.risk_per_trade_pct <= 0:
@@ -112,6 +130,7 @@ _ENV_KEYS = {
     "environment": "FP_ENV",
     "account_id": "FP_ACCOUNT_ID",
     "market_id": "FP_MARKET_ID",
+    "symbols": "FP_SYMBOLS",
     "strategy": "FP_STRATEGY",
     "timeframe": "FP_TIMEFRAME",
     "ema_fast": "FP_EMA_FAST",
@@ -142,11 +161,16 @@ _FLOAT_FIELDS = {
 }
 _INT_FIELDS = {"ema_fast", "ema_slow", "atr_period", "max_daily_trades"}
 _BOOL_FIELDS = {"dry_run"}
+_LIST_FIELDS = {"symbols"}
 
 
 def _coerce(name: str, value: Any) -> Any:
     if value is None:
         return None
+    if name in _LIST_FIELDS:
+        if isinstance(value, (list, tuple)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return [part.strip() for part in str(value).split(",") if part.strip()]
     if name in _FLOAT_FIELDS:
         return float(value)
     if name in _INT_FIELDS:

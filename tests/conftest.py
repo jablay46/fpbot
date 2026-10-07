@@ -12,6 +12,7 @@ import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -30,6 +31,25 @@ MARKET = {
     "min_notional": 10,
     "contract_size": 1,
 }
+
+MARKET_ETH = {
+    "market_id": "binance|ETHUSDT",
+    "provider": "binance",
+    "symbol": "ETH",
+    "coin": "ETHUSDT",
+    "size_decimals": 3,
+    "max_leverage": 10,
+    "tick_size": 1e-08,
+    "size_step": 0.001,
+    "min_size": 0.001,
+    "min_notional": 10,
+    "contract_size": 1,
+}
+
+MARKETS = [MARKET, MARKET_ETH]
+
+# Quotes keyed by market ID (mid price).
+QUOTES = {"binance|BTCUSDT": 100.1, "binance|ETHUSDT": 50.0}
 
 ACCOUNT = {
     "id": "acct-1",
@@ -117,14 +137,15 @@ class _Handler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items()}
         self.state.record(method, self.path, headers, body)
 
-        # Injected transient failures for retry tests.
         if self.state.fail_times.get(self.path, 0) > 0:
             self.state.fail_times[self.path] -= 1
             self._send(503, {"error": {"code": "unavailable", "message": "try later"}},
                        {"Retry-After": "0"})
             return
 
-        path = self.path.split("?", 1)[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
 
         if path == "/v1":
             self._send(200, {"data": {"name": "MyFundedPerps API", "version": "v1", "environment": "sandbox"}})
@@ -134,15 +155,26 @@ class _Handler(BaseHTTPRequestHandler):
             account = dict(ACCOUNT, status=self.state.account_status, risk=self.state.risk)
             self._send(200, {"data": account})
         elif path == "/v1/markets" and method == "GET":
-            self._send(200, {"data": [MARKET]})
-        elif path == "/v1/markets/binance%7CBTCUSDT":
-            self._send(200, {"data": MARKET})
-        elif path == "/v1/markets/binance%7CBTCUSDT/quote":
+            self._send(200, {"data": MARKETS})
+        elif path.startswith("/v1/markets/") and path.endswith("/quote"):
+            market_id = self._market_id_from_path(path[: -len("/quote")])
+            mid = QUOTES.get(market_id)
+            if mid is None:
+                self._send(404, {"error": {"code": "not_found", "message": "no market"}})
+                return
             self._send(200, {"data": {
-                "status": "ok", "market_id": MARKET["market_id"], "provider": "binance",
-                "symbol": "BTC", "coin": "BTCUSDT", "bid": 100.0, "ask": 100.2, "mid": 100.1,
+                "status": "ok", "market_id": market_id, "provider": "binance",
+                "symbol": market_id.split("|")[1], "coin": market_id.split("|")[1],
+                "bid": mid - 0.1, "ask": mid + 0.1, "mid": mid,
                 "time": 1_700_000_000_000, "fillable": True,
             }})
+        elif path.startswith("/v1/markets/"):
+            market_id = self._market_id_from_path(path)
+            for m in MARKETS:
+                if m["market_id"] == market_id:
+                    self._send(200, {"data": m})
+                    return
+            self._send(404, {"error": {"code": "not_found", "message": "no market"}})
         elif path == "/v1/positions" and method == "GET":
             self._send(200, {"data": self.state.positions})
         elif path.endswith("/close-all-positions") and method == "POST":
@@ -151,13 +183,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"data": {"status": "completed", "operation_id": "op-cancel"}})
         elif path == "/v1/orders" and method == "POST":
             order = dict(body or {})
-            order.update({"id": "order-1", "status": self.state.order_status,
+            order.update({"id": f"order-{len(self.state.orders) + 1}", "status": self.state.order_status,
                           "filled_size": (body or {}).get("size")})
             self.state.orders.append(order)
             self._send(201, {"data": order})
-        elif path == "/v1/orders/order-1":
-            order = self.state.orders[-1] if self.state.orders else {"id": "order-1"}
-            self._send(200, {"data": order})
+        elif path.startswith("/v1/orders/"):
+            order_id = path.rsplit("/", 1)[-1]
+            for o in self.state.orders:
+                if o["id"] == order_id:
+                    self._send(200, {"data": o})
+                    return
+            self._send(404, {"error": {"code": "not_found", "message": "no order"}})
         elif path.startswith("/v1/positions/") and path.endswith("/close"):
             self._send(200, {"data": {"id": "close-1", "status": "filled"}})
         elif path == "/v1/error":
@@ -167,6 +203,12 @@ class _Handler(BaseHTTPRequestHandler):
             }})
         else:
             self._send(404, {"error": {"code": "not_found", "message": f"no route for {path}"}})
+
+    @staticmethod
+    def _market_id_from_path(path: str) -> str:
+        from urllib.parse import unquote
+
+        return unquote(path[len("/v1/markets/"):])
 
     def do_GET(self) -> None:
         self._handle("GET")
@@ -200,14 +242,21 @@ def stub_server():
         thread.join(timeout=5)
 
 
-def make_candles(closes: list[float], *, start_time: int = 1_700_000_000_000, interval_ms: int = 60_000) -> list[Candle]:
+def make_candles(
+    closes: list[float],
+    *,
+    start_time: int = 1_700_000_000_000,
+    interval_ms: int = 60_000,
+    symbol: str = "BTCUSDT",
+    provider: str = "binance",
+) -> list[Candle]:
     candles = []
     for i, close in enumerate(closes):
         open_time = start_time + i * interval_ms
         candles.append(
             Candle(
-                provider="binance",
-                symbol="BTCUSDT",
+                provider=provider,
+                symbol=symbol,
                 interval="1m",
                 open_time=open_time,
                 close_time=open_time + interval_ms - 1,

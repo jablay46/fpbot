@@ -71,3 +71,38 @@ def test_unknown_config_field_rejected(tmp_path):
     path.write_text(json.dumps({"not_a_field": 1}), encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(env={"FP_API_KEY": "fp_test_abc"}, config_file=str(path), require_key=True)
+
+
+def test_symbols_parsed_from_env():
+    cfg = load_config(
+        env={"FP_API_KEY": "fp_test_abc",
+             "FP_SYMBOLS": "binance|BTCUSDT, binance|ETHUSDT ,hyperliquid|xyz:AAPL"},
+        require_key=True,
+    )
+    assert cfg.market_ids == ["binance|BTCUSDT", "binance|ETHUSDT", "hyperliquid|xyz:AAPL"]
+
+
+def test_symbols_defaults_to_market_id():
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_MARKET_ID": "binance|SOLUSDT"}, require_key=True)
+    assert cfg.market_ids == ["binance|SOLUSDT"]
+
+
+def test_duplicate_symbols_rejected():
+    with pytest.raises(ConfigError):
+        load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_SYMBOLS": "binance|BTCUSDT,binance|BTCUSDT"},
+            require_key=True,
+        )
+
+
+def test_too_many_symbols_rejected():
+    symbols = ",".join(f"binance|SYM{i}USDT" for i in range(33))
+    with pytest.raises(ConfigError):
+        load_config(env={"FP_API_KEY": "fp_test_abc", "FP_SYMBOLS": symbols}, require_key=True)
+
+
+def test_symbols_from_config_file_list(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"symbols": ["binance|BTCUSDT", "binance|ETHUSDT"]}), encoding="utf-8")
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc"}, config_file=str(path), require_key=True)
+    assert cfg.market_ids == ["binance|BTCUSDT", "binance|ETHUSDT"]

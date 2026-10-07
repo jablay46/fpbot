@@ -47,6 +47,11 @@ risk budget, and places orders with broker-side TP/SL.
   "historyLimit":N}}`. Server replies `sub_ok`, then `events` batches, then
   `snapshot_end`. Candle fields are decimal **strings**; use `isFinal` to act
   only on closed bars. Send `{"op":"req","id":N,"method":"ping"}` for heartbeat.
+* **Provider grouping gotcha (verified live):** a subscription that lists more
+  than one provider resolves every symbol against the first provider, so
+  `symbols:[BTCUSDT, xyz:AAPL], providers:[binance, hyperliquid]` is rejected
+  with `unknown market`. Group symbols by provider — one `sub` frame per
+  provider — on the same connection. `MarketDataStream.for_markets` does this.
 * The API is in **beta**; breaking changes are possible.
 * REST only covers trading on existing accounts. Signup, purchases, payouts,
   and API-key creation are website-only (and intentionally not automated here).

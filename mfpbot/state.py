@@ -17,20 +17,27 @@ log = logging.getLogger("mfpbot.state")
 @dataclass
 class BotState:
     risk: RiskState = field(default_factory=RiskState)
-    last_processed_open_time: Optional[int] = None
+    last_processed_open_time: dict[str, int] = field(default_factory=dict)
     last_entry_client_order_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        return data
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BotState":
         data = data or {}
         risk = RiskState.from_dict(data.get("risk", {}))
+        raw_last = data.get("last_processed_open_time")
+        if isinstance(raw_last, dict):
+            last = {str(k): int(v) for k, v in raw_last.items()}
+        elif raw_last is None:
+            last = {}
+        else:
+            # Migration from the single-market format.
+            last = {}
         return cls(
             risk=risk,
-            last_processed_open_time=data.get("last_processed_open_time"),
+            last_processed_open_time=last,
             last_entry_client_order_id=data.get("last_entry_client_order_id"),
         )
 
