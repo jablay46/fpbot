@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
@@ -20,6 +21,9 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 log = logging.getLogger("mfpbot.stream")
+
+# Request id reserved for app-level heartbeat pings; subscriptions use 1..n.
+PING_REQUEST_ID = 9000
 
 
 @dataclass
@@ -137,6 +141,9 @@ class MarketDataStream:
         interval: str = "15m",
         history_limit: int = 300,
         max_backoff: float = 60.0,
+        ping_interval: float = 20.0,
+        ping_request_id: int = PING_REQUEST_ID,
+        idle_timeout: float = 60.0,
     ) -> None:
         if not groups:
             raise ValueError("at least one subscription group is required")
@@ -149,6 +156,9 @@ class MarketDataStream:
         self.interval = interval
         self.history_limit = history_limit
         self.max_backoff = max_backoff
+        self.ping_interval = ping_interval
+        self.ping_request_id = ping_request_id
+        self.idle_timeout = idle_timeout
 
     @classmethod
     def for_markets(
@@ -171,6 +181,38 @@ class MarketDataStream:
         groups = [{"symbols": coins, "providers": [provider]} for provider, coins in by_provider.items()]
         return cls(url, groups=groups, interval=interval, history_limit=history_limit, max_backoff=max_backoff)
 
+    @staticmethod
+    def _ping_frame(request_id: int) -> str:
+        return json.dumps({"op": "req", "id": request_id, "method": "ping"})
+
+    async def _pump(self, ws, queue: "asyncio.Queue[Optional[str]]", last_seen: list) -> None:
+        """Forward raw frames into the queue; signal EOF with None."""
+        try:
+            async for raw in ws:
+                last_seen[0] = time.monotonic()
+                await queue.put(raw)
+        finally:
+            await queue.put(None)
+
+    async def _heartbeat(self, ws, request_id: int, last_seen: list) -> None:
+        """Send the app-level ping the feed expects and watch for silence.
+
+        Control frames are not used, so a half-open TCP connection would block
+        the reader forever. If no frame arrives within ``idle_timeout`` we close
+        the socket, which makes the pump end and the outer loop reconnect.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.ping_interval)
+                await ws.send(self._ping_frame(request_id))
+                if time.monotonic() - last_seen[0] > self.idle_timeout:
+                    log.warning("market stream idle for %.0fs; forcing reconnect", self.idle_timeout)
+                    await ws.close()
+                    return
+        except (ConnectionClosed, OSError, asyncio.TimeoutError):
+            # The reader pump reports the disconnect; let it drive reconnection.
+            return
+
     def _subscribe_frame(self, request_id: int, group: dict) -> str:
         payload: dict = {"symbols": group["symbols"], "intervals": [self.interval], "historyLimit": self.history_limit}
         if group.get("providers"):
@@ -186,8 +228,7 @@ class MarketDataStream:
                 async with websockets.connect(
                     self.url,
                     open_timeout=20,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=None,
                     max_size=2 * 1024 * 1024,
                 ) as ws:
                     for group in self.groups:
@@ -196,22 +237,38 @@ class MarketDataStream:
                     backoff = 1.0
                     log.info("market stream connected (%d subscription group(s), %s)",
                              len(self.groups), self.interval)
-                    async for raw in ws:
-                        frame = json.loads(raw)
-                        op = frame.get("op")
-                        if op == "events":
-                            for ev in frame.get("events", []):
-                                if ev.get("type") == "candle":
-                                    yield Candle.from_event(ev)
-                        elif op == "sub_err":
-                            log.error("subscription rejected: %s", frame.get("error"))
-                            raise RuntimeError(f"subscription rejected: {frame.get('error')}")
-                        elif op == "draining":
-                            log.warning("stream draining; reconnecting")
-                            break
-                        elif op == "end":
-                            log.warning("subscription ended by server; reconnecting")
-                            break
+                    queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+                    last_seen = [time.monotonic()]
+                    pump = asyncio.create_task(self._pump(ws, queue, last_seen))
+                    heartbeat = asyncio.create_task(
+                        self._heartbeat(ws, self.ping_request_id, last_seen)
+                    )
+                    try:
+                        while True:
+                            raw = await queue.get()
+                            if raw is None:
+                                # Retrieve any transport error so the outer
+                                # handler applies backoff instead of tight-looping.
+                                await pump
+                                break
+                            frame = json.loads(raw)
+                            op = frame.get("op")
+                            if op == "events":
+                                for ev in frame.get("events", []):
+                                    if ev.get("type") == "candle":
+                                        yield Candle.from_event(ev)
+                            elif op == "sub_err":
+                                log.error("subscription rejected: %s", frame.get("error"))
+                                raise RuntimeError(f"subscription rejected: {frame.get('error')}")
+                            elif op == "draining":
+                                log.warning("stream draining; reconnecting")
+                                break
+                            elif op == "end":
+                                log.warning("subscription ended by server; reconnecting")
+                                break
+                    finally:
+                        pump.cancel()
+                        heartbeat.cancel()
             except asyncio.CancelledError:
                 raise
             except RuntimeError:
