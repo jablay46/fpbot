@@ -320,6 +320,47 @@ def test_pending_entry_is_reconciled_on_later_candle(stub_server, tmp_path):
     assert bot.state.pending_entry is None
 
 
+def _owned_short(state, market_id="binance|BTCUSDT", position_id="pos-1"):
+    state.positions = [{
+        "id": position_id, "account_id": "acct-1", "market_id": market_id,
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "short",
+        "size": 0.01, "entry_price": 120.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    return [position_id]
+
+
+def test_reversal_adopts_the_new_position_when_close_lags(stub_server, tmp_path):
+    """A closed-but-still-listed old position must not be re-adopted."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    bot.state.owned_position_ids = _owned_short(state)
+    state.slow_close_polls = 2  # the old position lingers for two polls
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert bot.state.owned_position_ids == ["pos-2"]
+
+
+def test_reversal_skips_entry_when_old_position_will_not_close(stub_server, tmp_path):
+    """If the old position will not go away, do not stack a new one on top."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    bot.state.owned_position_ids = _owned_short(state)
+    state.slow_close_polls = 10_000  # never disappears within the wait window
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+    assert bot.state.owned_position_ids == []
+
+
 def test_kill_switch_runs_while_holding_a_position(stub_server, tmp_path):
     """A bot-owned position must not shield the account from the daily kill switch."""
     bot, state = build_bot(stub_server, tmp_path)

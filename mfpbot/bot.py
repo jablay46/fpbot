@@ -327,6 +327,21 @@ class Bot:
         log.warning("%s: order %s ended in status %s", market_id, order_id, status)
         return None
 
+    def _wait_position_gone(self, position_id: str, timeout: float = 5.0) -> bool:
+        """Poll until a closed position disappears from the open list."""
+        deadline = time.monotonic() + timeout
+        delay = 0.5
+        while time.monotonic() < deadline:
+            try:
+                if not any(p["id"] == position_id for p in self._open_positions()):
+                    return True
+            except ApiError as exc:
+                log.warning("could not confirm position %s is closed: %s", position_id, exc)
+                return False
+            time.sleep(delay)
+            delay = min(delay * 1.5, 2.0)
+        return False
+
     def _close_position(self, market_id: str, position: dict[str, Any]) -> bool:
         if self.cfg.dry_run:
             log.info("[dry-run] %s: would close position %s", market_id, position["id"])
@@ -422,8 +437,18 @@ class Bot:
                 return
             if signal is not None and self._is_opposite(signal.action, position.get("side")):
                 log.info("%s: reversal (%s); closing %s position", market_id, signal.reason, position.get("side"))
-                if self._close_position(market_id, position):
-                    position = None
+                if not self._close_position(market_id, position):
+                    log.warning("%s: could not close %s; skipping reversal", market_id, position.get("id"))
+                    return
+                # Wait for the old position to leave the book so the new one can
+                # be adopted unambiguously; otherwise skip rather than stack.
+                if not self._wait_position_gone(position["id"]):
+                    log.warning(
+                        "%s: position %s still open after close; skipping reversal entry",
+                        market_id, position["id"],
+                    )
+                    return
+                position = None
             else:
                 return
 

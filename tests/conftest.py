@@ -114,6 +114,9 @@ class StubState:
     now_ms: int = 1_700_000_000_000
     # Positions already closed by id; used to model the close-lag window.
     closed_position_ids: list[str] = field(default_factory=list)
+    # Monotonic counter so exchange position ids never collide with ones a test
+    # seeded directly into ``positions``.
+    position_seq: int = 0
 
     def record(self, method: str, path: str, headers: dict[str, str], body: Any) -> None:
         self.requests.append({"method": method, "path": path, "headers": headers, "body": body})
@@ -222,7 +225,12 @@ class _Handler(BaseHTTPRequestHandler):
             )
             if existing is None:
                 seq = len(self.state.orders) + 1
-                position_id = f"pos-{seq}"
+                used = {p["id"] for p in self.state.positions}
+                self.state.position_seq += 1
+                position_id = f"pos-{self.state.position_seq}"
+                while position_id in used:
+                    self.state.position_seq += 1
+                    position_id = f"pos-{self.state.position_seq}"
                 order.update({"id": f"order-{seq}", "status": self.state.order_status,
                               "filled_size": (body or {}).get("size"),
                               "position_id": position_id})
