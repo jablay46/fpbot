@@ -80,6 +80,16 @@ def test_bullish_cross_places_order_with_protection(stub_server, tmp_path):
     assert body["client_order_id"].startswith("mfpbot:binance|BTCUSDT:")
 
 
+def test_fill_is_adopted_so_the_bot_owns_the_position(stub_server, tmp_path):
+    bot, state = build_bot(stub_server, tmp_path)
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    # The stub opened pos-1 for our fill; the bot must track it as its own.
+    assert bot.state.owned_position_ids == ["pos-1"]
+
+
 def test_bearish_cross_places_short(stub_server, tmp_path):
     bot, state = build_bot(stub_server, tmp_path)
     candle = feed(bot, "binance|BTCUSDT", scale(DOWN_CLOSES, QUOTES["binance|BTCUSDT"]))

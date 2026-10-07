@@ -184,10 +184,25 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/v1/orders" and method == "POST":
             order = dict(body or {})
             seq = len(self.state.orders) + 1
+            position_id = f"pos-{seq}"
             order.update({"id": f"order-{seq}", "status": self.state.order_status,
                           "filled_size": (body or {}).get("size"),
-                          "position_id": f"pos-{seq}"})
+                          "position_id": position_id})
             self.state.orders.append(order)
+            # Mirror the live API: a filled entry opens a position, which the
+            # bot must then discover and adopt by market id.
+            if self.state.order_status == "filled":
+                self.state.positions.append({
+                    "id": position_id, "account_id": order.get("account_id", "acct-1"),
+                    "market_id": order.get("market_id"), "provider": "binance",
+                    "symbol": order.get("market_id", "").split("|")[-1][:3],
+                    "coin": order.get("market_id", "").split("|")[-1],
+                    "side": "long" if order.get("side") == "buy" else "short",
+                    "size": order.get("size"), "entry_price": order.get("expected_price") or 100.0,
+                    "leverage": order.get("leverage") or 2.0,
+                    "margin_mode": order.get("margin_mode", "cross"),
+                    "status": "open", "opened_at": seq,
+                })
             self._send(201, {"data": order})
         elif path.startswith("/v1/orders/"):
             order_id = path.rsplit("/", 1)[-1]

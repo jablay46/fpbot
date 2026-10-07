@@ -162,10 +162,33 @@ class Bot:
         self.state.last_entry_client_order_id = client_order_id
         filled = self._await_order(market_id, created)
         if filled is not None:
-            position_id = filled.get("position_id") or filled.get("target_position_id")
-            if position_id:
-                self._remember_position(position_id)
+            self._adopt_position(market_id)
         return filled
+
+    def _adopt_position(self, market_id: str, timeout: float = 8.0) -> None:
+        """Link the position our fill created so the bot manages it.
+
+        Entry orders do not return a position_id, so match the freshly opened
+        position on this market. Markets with a pre-existing manual position are
+        skipped before entry, so any new position here is ours.
+        """
+        deadline = time.monotonic() + timeout
+        delay = 0.5
+        while time.monotonic() < deadline:
+            try:
+                positions = self._open_positions()
+            except ApiError as exc:
+                log.warning("%s: could not adopt position: %s", market_id, exc)
+                return
+            for pos in positions:
+                if pos.get("market_id") == market_id and pos["id"] not in self.state.owned_position_ids:
+                    self._remember_position(pos["id"])
+                    log.info("%s: adopted position %s (%s)", market_id, pos["id"], pos.get("side"))
+                    save_state(self.cfg.state_file, self.state)
+                    return
+            time.sleep(delay)
+            delay = min(delay * 1.5, 2.0)
+        log.warning("%s: could not find the position from our fill; it still has broker-side SL/TP", market_id)
 
     def _remember_position(self, position_id: str) -> None:
         if position_id not in self.state.owned_position_ids:
