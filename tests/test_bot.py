@@ -7,7 +7,7 @@ import pytest
 from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
-from mfpbot.state import BotState
+from mfpbot.state import BotState, load_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
 
 # Downtrend that turns up: bullish EMA cross on the final candle.
@@ -22,8 +22,8 @@ def scale(closes, mid):
     return [round(c * factor, 4) for c in closes]
 
 
-def build_bot(stub_server, tmp_path, symbols=None, **overrides):
-    base_url, state = stub_server
+def build_bot(stub_server, tmp_path, symbols=None, state=None, clock=None, **overrides):
+    base_url, stub = stub_server
     cfg = Config(
         api_key="fp_test_abc",
         environment="sandbox",
@@ -49,16 +49,18 @@ def build_bot(stub_server, tmp_path, symbols=None, **overrides):
         setattr(cfg, key, value)
     cfg.validate()
     client = MfpClient(cfg.api_key, base_url, sleep=lambda _s: None)
-    bot = Bot(cfg, client=client, state=BotState())
+    bot = Bot(cfg, client=client, state=state if state is not None else BotState())
     bot.account = client.get_account("acct-1")
     bot.resolve_markets()
     bot.risk = bot._build_risk_manager()
-    return bot, state
+    if clock is not None:
+        bot.clock = clock
+    return bot, stub
 
 
-def feed(bot, market_id, closes):
+def feed(bot, market_id, closes, **kwargs):
     symbol = bot.markets[market_id]["coin"]
-    for candle in make_candles(closes, symbol=symbol):
+    for candle in make_candles(closes, symbol=symbol, **kwargs):
         bot.series[market_id].add(candle)
     return bot.series[market_id].closed[-1]
 
@@ -238,6 +240,58 @@ def test_stale_quote_skips_entry(stub_server, tmp_path):
     )
     bot.on_closed_candle("binance|BTCUSDT", bot.series["binance|BTCUSDT"].closed[-1])
     assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_history_replay_is_not_traded(stub_server, tmp_path):
+    """300 historical candles with a crossover inside must not trade."""
+    bot, state = build_bot(stub_server, tmp_path)
+    # A long history whose last-but-one candle crosses; all of it is old.
+    closes = [100.0] * 290 + [95.0, 90.0, 85.0, 80.0, 81.0, 95.0]
+    history = make_candles(closes, symbol="BTCUSDT")
+    for candle in history:
+        bot.series["binance|BTCUSDT"].add(candle)
+        bot._process_candle("binance|BTCUSDT", candle)
+
+    orders = [r for r in state.requests if r["path"] == "/v1/orders"]
+    accounts = [r for r in state.requests if r["path"] == "/v1/accounts/acct-1"]
+    assert orders == []
+    assert len(accounts) <= 2
+    assert bot.state.risk.entries_today == 0
+
+
+def test_fresh_candle_after_history_still_trades(stub_server, tmp_path):
+    """A fresh crossing candle is evaluated once the history is behind us."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    closes = scale([100.0] * 290 + [95.0, 90.0, 85.0, 80.0, 81.0, 95.0], QUOTES["binance|BTCUSDT"])
+    start = now_ms - len(closes) * 60_000
+    history = make_candles(closes, start_time=start, symbol="BTCUSDT")
+    for candle in history[:-1]:
+        bot._process_candle("binance|BTCUSDT", candle)
+    fresh = history[-1]
+    assert fresh.close_time >= now_ms - 60_000
+    bot._process_candle("binance|BTCUSDT", fresh)
+
+    orders = [r for r in state.requests if r["path"] == "/v1/orders"]
+    assert len(orders) == 1
+
+
+def test_restart_does_not_reprocess_last_candle(stub_server, tmp_path):
+    """A restart with a persisted cursor skips already-seen candles."""
+    cursor = 1_700_000_000_000 + 6 * 60_000
+    saved = BotState(last_processed_open_time={"binance|BTCUSDT": cursor})
+    now_ms = cursor + 60_000 + 1000
+    bot, state = build_bot(
+        stub_server, tmp_path, state=saved, clock=lambda: now_ms / 1000.0
+    )
+    closes = [100.0] * 290 + [95.0, 90.0, 85.0, 80.0, 81.0, 95.0]
+    start = cursor - (len(closes) - 1) * 60_000
+    for candle in make_candles(closes, start_time=start, symbol="BTCUSDT"):
+        bot._process_candle("binance|BTCUSDT", candle)
+
+    orders = [r for r in state.requests if r["path"] == "/v1/orders"]
+    assert orders == []
+    assert bot.state.risk.entries_today == 0
 
 
 def test_market_id_mapping(stub_server, tmp_path):

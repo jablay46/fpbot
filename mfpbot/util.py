@@ -2,8 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from decimal import ROUND_DOWN, Decimal
 from typing import Optional
+
+_INTERVAL_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
+_INTERVAL_UNITS_MS = {
+    "s": 1_000,
+    "m": 60_000,
+    "h": 3_600_000,
+    "d": 86_400_000,
+    "w": 604_800_000,
+}
+
+
+def parse_interval_ms(interval: str) -> int:
+    """Convert a candle interval like ``15m`` or ``1h`` to milliseconds.
+
+    Returns 0 for anything unparseable so callers can treat it as "unknown".
+    """
+    match = _INTERVAL_RE.match(interval or "")
+    if not match:
+        return 0
+    return int(match.group(1)) * _INTERVAL_UNITS_MS[match.group(2).lower()]
 
 
 def round_step(value: float, step: float, *, mode: str = "down") -> float:

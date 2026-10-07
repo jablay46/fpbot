@@ -20,7 +20,7 @@ from .risk.manager import RiskManager, RiskState
 from .risk.sizing import PositionSizer
 from .state import BotState, load_state, save_state
 from .strategy import build_strategy
-from .util import fmt
+from .util import fmt, parse_interval_ms
 
 log = logging.getLogger("mfpbot.bot")
 
@@ -28,6 +28,9 @@ TERMINAL_ORDER_STATES = {"filled", "rejected", "canceled", "cancelled", "expired
 # Assume the exchange could not have moved more than this fraction between the
 # last closed candle and the quote; used to skip entries on a stale/broken feed.
 MAX_ENTRY_DRIFT = 0.05
+# A candle is only acted on if its close is within this many intervals of now;
+# older bars are history/backfill and must never trigger a live order.
+FRESHNESS_INTERVALS = 1.5
 
 
 class Bot:
@@ -56,6 +59,9 @@ class Bot:
         # Per-symbol rotation cursor so one symbol cannot starve the others
         # when several signals fire at the same time.
         self._rotation = 0
+        # Injectable wall clock (seconds) so tests can control candle freshness.
+        self.clock = time.time
+        self._interval_ms = parse_interval_ms(config.timeframe)
 
     # -- setup ------------------------------------------------------------
 
@@ -469,20 +475,42 @@ class Bot:
             market_id = self._market_id_for(candle)
             if market_id is None:
                 continue
-            self.series[market_id].add(candle)
-            if not candle.is_final:
-                continue
-            if self.state.last_processed_open_time.get(market_id) == candle.open_time:
-                continue
             try:
-                self.on_closed_candle(market_id, candle)
+                self._process_candle(market_id, candle)
             except SystemExit:
                 return
             except Exception as exc:  # noqa: BLE001 - one bad candle must not kill the bot
                 log.exception("%s: error handling candle %s: %s", market_id, candle.open_time, exc)
+
+    def _process_candle(self, market_id: str, candle: Candle) -> None:
+        """Route one streamed candle to the series and, if fresh, the strategy.
+
+        Only a recent candle is a live signal source. Older bars (the history
+        snapshot replayed on every start/reconnect) are appended to the series
+        and advance the cursor, but they never make REST calls or place orders —
+        otherwise backfilled crossovers would trade on startup.
+        """
+        self.series[market_id].add(candle)
+        if not candle.is_final:
+            return
+        last = self.state.last_processed_open_time.get(market_id)
+        if last is not None and candle.open_time <= last:
+            return
+        if not self._is_fresh(candle):
             self.state.last_processed_open_time[market_id] = candle.open_time
-            self._rotation += 1
-            save_state(self.cfg.state_file, self.state)
+            return
+        self.on_closed_candle(market_id, candle)
+        self.state.last_processed_open_time[market_id] = candle.open_time
+        self._rotation += 1
+        save_state(self.cfg.state_file, self.state)
+
+    def _is_fresh(self, candle: Candle) -> bool:
+        """True when the candle closed recently enough to act on."""
+        interval_ms = parse_interval_ms(candle.interval) or self._interval_ms
+        if interval_ms <= 0:
+            return False
+        now_ms = int(self.clock() * 1000)
+        return (now_ms - candle.close_time) <= FRESHNESS_INTERVALS * interval_ms
 
     def _market_id_for(self, candle: Candle) -> Optional[str]:
         """Map a streamed candle (provider + venue symbol) back to a market ID."""

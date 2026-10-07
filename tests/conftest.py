@@ -12,7 +12,7 @@ import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -100,9 +100,37 @@ class StubState:
     risk: dict[str, Any] = field(default_factory=lambda: risk_snapshot())
     order_status: str = "filled"
     account_status: str = "active"
+    # Number of times to drop a POST /v1/orders response after recording the
+    # order, simulating the order being accepted but the reply lost.
+    drop_order_response_times: int = 0
+    # Number of GET /v1/orders responses to answer 503 (lookup also failing).
+    fail_order_lookup_times: int = 0
+    # Number of extra polls during which a closed position still appears open.
+    slow_close_polls: int = 0
+    # When true, GET /v1/accounts records but drops the response.
+    drop_account_response: bool = False
+    # Simulated current time in ms for the account risk snapshot.
+    now_ms: int = 1_700_000_000_000
+    # Positions already closed by id; used to model the close-lag window.
+    closed_position_ids: list[str] = field(default_factory=list)
 
     def record(self, method: str, path: str, headers: dict[str, str], body: Any) -> None:
         self.requests.append({"method": method, "path": path, "headers": headers, "body": body})
+
+    def open_positions(self) -> list[dict[str, Any]]:
+        """Positions as the API would report them, honouring the close lag."""
+        rows = []
+        for pos in self.positions:
+            if pos.get("status") != "open":
+                continue
+            if pos["id"] in self.closed_position_ids:
+                # A closed position can linger for a few polls on the real API.
+                if self.slow_close_polls > 0:
+                    self.slow_close_polls -= 1
+                    rows.append(pos)
+                continue
+            rows.append(pos)
+        return rows
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -153,6 +181,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"data": [ACCOUNT]})
         elif path == "/v1/accounts/acct-1":
             account = dict(ACCOUNT, status=self.state.account_status, risk=self.state.risk)
+            if self.state.drop_account_response:
+                return
             self._send(200, {"data": account})
         elif path == "/v1/markets" and method == "GET":
             self._send(200, {"data": MARKETS})
@@ -176,13 +206,22 @@ class _Handler(BaseHTTPRequestHandler):
                     return
             self._send(404, {"error": {"code": "not_found", "message": "no market"}})
         elif path == "/v1/positions" and method == "GET":
-            self._send(200, {"data": self.state.positions})
+            self._send(200, {"data": self.state.open_positions()})
         elif path.endswith("/close-all-positions") and method == "POST":
             self._send(200, {"data": {"status": "completed", "operation_id": "op-close"}})
         elif path.endswith("/cancel-all-orders") and method == "POST":
             self._send(200, {"data": {"status": "completed", "operation_id": "op-cancel"}})
         elif path == "/v1/orders" and method == "POST":
             order = dict(body or {})
+            # Idempotency: a repeat of the same client_order_id returns the same
+            # order instead of opening a second position.
+            existing = next(
+                (o for o in self.state.orders if o.get("client_order_id") == order.get("client_order_id")),
+                None,
+            )
+            if existing is not None:
+                self._send(201, {"data": existing})
+                return
             seq = len(self.state.orders) + 1
             position_id = f"pos-{seq}"
             order.update({"id": f"order-{seq}", "status": self.state.order_status,
@@ -203,15 +242,26 @@ class _Handler(BaseHTTPRequestHandler):
                     "margin_mode": order.get("margin_mode", "cross"),
                     "status": "open", "opened_at": seq,
                 })
+            if self.state.drop_order_response_times > 0:
+                # The order was accepted (and recorded) but the reply is lost.
+                self.state.drop_order_response_times -= 1
+                return
             self._send(201, {"data": order})
         elif path.startswith("/v1/orders/"):
             order_id = path.rsplit("/", 1)[-1]
+            if self.state.fail_order_lookup_times > 0:
+                self.state.fail_order_lookup_times -= 1
+                self._send(503, {"error": {"code": "unavailable", "message": "try later"}})
+                return
             for o in self.state.orders:
                 if o["id"] == order_id:
                     self._send(200, {"data": o})
                     return
             self._send(404, {"error": {"code": "not_found", "message": "no order"}})
         elif path.startswith("/v1/positions/") and path.endswith("/close"):
+            position_id = unquote(path[len("/v1/positions/"): -len("/close")])
+            if position_id not in self.state.closed_position_ids:
+                self.state.closed_position_ids.append(position_id)
             self._send(200, {"data": {"id": "close-1", "status": "filled"}})
         elif path == "/v1/error":
             self._send(422, {"error": {
@@ -264,6 +314,7 @@ def make_candles(
     *,
     start_time: int = 1_700_000_000_000,
     interval_ms: int = 60_000,
+    interval: str = "1m",
     symbol: str = "BTCUSDT",
     provider: str = "binance",
 ) -> list[Candle]:
@@ -274,7 +325,7 @@ def make_candles(
             Candle(
                 provider=provider,
                 symbol=symbol,
-                interval="1m",
+                interval=interval,
                 open_time=open_time,
                 close_time=open_time + interval_ms - 1,
                 open=close,
