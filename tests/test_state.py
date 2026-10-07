@@ -40,3 +40,17 @@ def test_legacy_scalar_cursor_migrates_to_empty_dict(tmp_path):
     path.write_text('{"risk": {"day": "2026-01-01"}, "last_processed_open_time": 123}', encoding="utf-8")
     loaded = load_state(path)
     assert loaded.last_processed_open_time == {}
+
+
+def test_save_state_never_raises_on_unwritable_path(tmp_path):
+    # A directory where the state file should be makes writes fail; the helper
+    # must swallow the error so the trading loop keeps running.
+    target = tmp_path / "state.json"
+    target.mkdir()
+    save_state(target, BotState(owned_position_ids=["pos-1"]))  # must not raise
+
+
+def test_owned_position_ids_round_trip(tmp_path):
+    path = tmp_path / "state.json"
+    save_state(path, BotState(owned_position_ids=["pos-1", "pos-2"]))
+    assert load_state(path).owned_position_ids == ["pos-1", "pos-2"]

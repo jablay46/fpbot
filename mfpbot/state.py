@@ -19,6 +19,8 @@ class BotState:
     risk: RiskState = field(default_factory=RiskState)
     last_processed_open_time: dict[str, int] = field(default_factory=dict)
     last_entry_client_order_id: Optional[str] = None
+    # Positions opened by this bot, so it never touches manual positions.
+    owned_position_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -30,15 +32,15 @@ class BotState:
         raw_last = data.get("last_processed_open_time")
         if isinstance(raw_last, dict):
             last = {str(k): int(v) for k, v in raw_last.items()}
-        elif raw_last is None:
-            last = {}
         else:
-            # Migration from the single-market format.
+            # None or a legacy scalar cursor from the single-market format.
             last = {}
+        owned = data.get("owned_position_ids") or []
         return cls(
             risk=risk,
             last_processed_open_time=last,
             last_entry_client_order_id=data.get("last_entry_client_order_id"),
+            owned_position_ids=[str(p) for p in owned],
         )
 
 
@@ -54,7 +56,20 @@ def load_state(path: str | os.PathLike[str]) -> BotState:
 
 
 def save_state(path: str | os.PathLike[str], state: BotState) -> None:
+    """Persist state atomically, but never let a write failure stop the bot."""
     p = Path(path)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    payload = json.dumps(state.to_dict(), indent=2)
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        if p.parent and not p.parent.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, p)
+        return
+    except OSError as exc:
+        log.warning("atomic state save failed (%s); trying direct write", exc)
+    try:
+        tmp.unlink(missing_ok=True)
+        p.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        log.error("could not persist state to %s: %s", p, exc)

@@ -55,6 +55,8 @@ Key settings (see `.env.example` for all of them):
 | `FP_LEVERAGE`, `FP_MARGIN_MODE` | Order leverage and `cross`/`isolated` |
 | `FP_MAX_DAILY_LOSS_PCT`, `FP_MAX_DAILY_TRADES` | Bot-side daily guards |
 | `FP_MIN_DAILY_ROOM_PCT` | Stop/flatten when account loss room falls below this % of starting balance |
+| `FP_MAX_MARGIN_PCT` | Cap total position margin across markets as a percent of equity |
+| `FP_FLATTEN_SCOPE` | `bot` closes only bot-opened positions; `account` closes all |
 | `FP_DRY_RUN` | Log intended orders without sending them |
 
 ## Use
@@ -134,6 +136,11 @@ trigger even if the bot is offline.
 * **Account guards** — reads the API risk snapshot (`daily_loss_room`,
   `max_drawdown_room`). When room falls below `FP_MIN_DAILY_ROOM_PCT` of the
   starting balance, the bot flattens positions and halts.
+* **Portfolio margin cap** — total position margin across all markets cannot
+  exceed `FP_MAX_MARGIN_PCT` of equity; new entries are skipped once it is hit.
+* **Manual positions are safe** — the bot tracks the positions it opened and
+  never closes or reverses a position it did not create. Flattening defaults to
+  `bot` scope; set `FP_FLATTEN_SCOPE=account` to close the whole account.
 * **Account state** — if the account is `failed` or `closed`, the bot stops.
 * **Idempotency** — every create/close uses an `Idempotency-Key`; entries also
   carry a `client_order_id` for reconciliation after a lost response.

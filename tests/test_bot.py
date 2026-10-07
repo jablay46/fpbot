@@ -122,16 +122,51 @@ def test_existing_position_in_one_market_does_not_block_another(stub_server, tmp
     assert orders[0]["market_id"] == "binance|ETHUSDT"
 
 
-def test_daily_room_floor_flattens_and_blocks_entry(stub_server, tmp_path):
+def test_daily_room_floor_flattens_owned_and_blocks_entry(stub_server, tmp_path):
     bot, state = build_bot(stub_server, tmp_path)
     state.risk = risk_snapshot(daily_loss_room=100.0)  # below the 500 floor
+    state.positions = [{
+        "id": "pos-own", "account_id": "acct-1", "market_id": "binance|ETHUSDT",
+        "provider": "binance", "symbol": "ETH", "coin": "ETHUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    bot.state.owned_position_ids = ["pos-own"]
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+    assert not any(r["path"].endswith("close-all-positions") for r in state.requests)
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+    assert bot.state.risk.halted
+
+
+def test_account_scope_flatten_uses_close_all(stub_server, tmp_path):
+    bot, state = build_bot(stub_server, tmp_path, flatten_scope="account")
+    state.risk = risk_snapshot(daily_loss_room=100.0)
     candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
 
     bot.on_closed_candle("binance|BTCUSDT", candle)
 
     assert any(r["path"] == "/v1/accounts/acct-1/close-all-positions" for r in state.requests)
+
+
+def test_manual_position_is_never_closed_or_reversed(stub_server, tmp_path):
+    bot, state = build_bot(stub_server, tmp_path)
+    # A manual short position in the traded market, not opened by the bot.
+    state.positions = [{
+        "id": "pos-manual", "account_id": "acct-1", "market_id": "binance|BTCUSDT",
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "short",
+        "size": 0.01, "entry_price": 120.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))  # bullish -> would reverse
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/positions/pos-manual/close" for r in state.requests)
     assert not any(r["path"] == "/v1/orders" for r in state.requests)
-    assert bot.state.risk.halted
 
 
 def test_no_trade_without_a_signal(stub_server, tmp_path):
@@ -160,6 +195,7 @@ def test_reversal_closes_existing_position(stub_server, tmp_path):
         "size": 0.01, "entry_price": 120.0, "leverage": 2.0, "margin_mode": "cross",
         "status": "open", "opened_at": 1,
     }]
+    bot.state.owned_position_ids = ["pos-1"]
     candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
 
     bot.on_closed_candle("binance|BTCUSDT", candle)

@@ -183,8 +183,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"data": {"status": "completed", "operation_id": "op-cancel"}})
         elif path == "/v1/orders" and method == "POST":
             order = dict(body or {})
-            order.update({"id": f"order-{len(self.state.orders) + 1}", "status": self.state.order_status,
-                          "filled_size": (body or {}).get("size")})
+            seq = len(self.state.orders) + 1
+            order.update({"id": f"order-{seq}", "status": self.state.order_status,
+                          "filled_size": (body or {}).get("size"),
+                          "position_id": f"pos-{seq}"})
             self.state.orders.append(order)
             self._send(201, {"data": order})
         elif path.startswith("/v1/orders/"):

@@ -160,7 +160,29 @@ class Bot:
             return None
 
         self.state.last_entry_client_order_id = client_order_id
-        return self._await_order(market_id, created)
+        filled = self._await_order(market_id, created)
+        if filled is not None:
+            position_id = filled.get("position_id") or filled.get("target_position_id")
+            if position_id:
+                self._remember_position(position_id)
+        return filled
+
+    def _remember_position(self, position_id: str) -> None:
+        if position_id not in self.state.owned_position_ids:
+            self.state.owned_position_ids.append(position_id)
+
+    def _forget_position(self, position_id: str) -> None:
+        if position_id in self.state.owned_position_ids:
+            self.state.owned_position_ids.remove(position_id)
+
+    def _owned_positions(self, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        owned = set(self.state.owned_position_ids)
+        return [p for p in positions if p["id"] in owned]
+
+    def _prune_owned(self, positions: list[dict[str, Any]]) -> None:
+        """Drop tracked IDs for positions that no longer exist (TP/SL/manual close)."""
+        live = {p["id"] for p in positions}
+        self.state.owned_position_ids = [pid for pid in self.state.owned_position_ids if pid in live]
 
     def _await_order(self, market_id: str, created: dict[str, Any], timeout: float = 20.0) -> Optional[dict[str, Any]]:
         status = created.get("status")
@@ -195,12 +217,25 @@ class Bot:
             log.error("%s: failed to close position %s: %s", market_id, position["id"], exc)
             return False
         log.info("%s: close submitted for position %s (%s)", market_id, position["id"], position.get("side"))
+        self._forget_position(position["id"])
         return True
 
     def _flatten(self) -> None:
         if self.cfg.dry_run:
-            log.info("[dry-run] would flatten account %s", self.account["id"])
+            log.info("[dry-run] would flatten bot positions for account %s", self.account["id"])
             return
+        if self.cfg.flatten_scope == "account":
+            self._flatten_account()
+            return
+        positions = self._owned_positions(self._open_positions())
+        if not positions:
+            log.info("flatten: no bot-owned positions to close")
+            return
+        log.warning("flatten: closing %d bot-owned position(s)", len(positions))
+        for position in positions:
+            self._close_position(position.get("market_id"), position)
+
+    def _flatten_account(self) -> None:
         key = self.client.new_idempotency_key()
         for _ in range(20):
             try:
@@ -210,6 +245,7 @@ class Bot:
                 return
             if not isinstance(result, dict) or result.get("status") == "completed":
                 log.info("flatten completed")
+                self.state.owned_position_ids = []
                 return
             time.sleep(2.0)
         log.warning("flatten did not report completion within retry budget")
@@ -230,6 +266,7 @@ class Bot:
         self.risk.roll_day(self.state.risk, equity)
 
         positions = self._open_positions()
+        self._prune_owned(positions)
         position = self._position_for(positions, market_id)
         series = self.series[market_id]
         signal = self.strategy.evaluate(series.closed, self.markets[market_id])
@@ -243,6 +280,9 @@ class Bot:
         )
 
         if position is not None:
+            if position["id"] not in self.state.owned_position_ids:
+                # Never touch positions this bot did not open.
+                return
             if signal is not None and self._is_opposite(signal.action, position.get("side")):
                 log.info("%s: reversal (%s); closing %s position", market_id, signal.reason, position.get("side"))
                 if self._close_position(market_id, position):
@@ -262,7 +302,24 @@ class Bot:
         if signal is None:
             return
 
+        if self._margin_headroom(positions, equity) <= 0:
+            log.warning("%s: portfolio margin cap reached; skipping entry", market_id)
+            return
+
         self._open_from_signal(market_id, signal, candle, account_risk, equity, positions)
+
+    def _position_margin(self, position: dict[str, Any]) -> float:
+        return (
+            float(position.get("size") or 0.0)
+            * float(position.get("entry_price") or 0.0)
+            / float(position.get("leverage") or 1.0)
+        )
+
+    def _margin_headroom(self, positions: list[dict[str, Any]], equity: float) -> float:
+        """Remaining margin budget before the portfolio cap is hit."""
+        cap = equity * self.cfg.max_margin_pct / 100.0
+        used = sum(self._position_margin(p) for p in positions)
+        return cap - used
 
     @staticmethod
     def _is_opposite(action: str, position_side: Optional[str]) -> bool:
@@ -312,13 +369,17 @@ class Bot:
         # Margin is reserved across the whole account, so account for positions
         # already open in other markets when sizing a new one.
         other_margin = sum(
-            float(p.get("size") or 0.0) * float(p.get("entry_price") or 0.0) / float(p.get("leverage") or 1.0)
-            for p in positions
-            if p.get("market_id") != market_id
+            self._position_margin(p) for p in positions if p.get("market_id") != market_id
         )
         available = account_risk.get("available_balance")
         if available is not None:
             available = max(0.0, float(available) - other_margin)
+        # Never exceed the portfolio margin budget.
+        headroom = self._margin_headroom(positions, equity)
+        if available is not None:
+            available = min(available, max(0.0, headroom))
+        else:
+            available = max(0.0, headroom)
 
         sizer = PositionSizer(
             risk_per_trade_pct=self.cfg.risk_per_trade_pct,

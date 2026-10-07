@@ -49,6 +49,10 @@ class Config:
     max_daily_loss_pct: float = 2.0
     max_daily_trades: int = 6
     min_daily_room_pct: float = 0.5
+    # Cap total position margin as a percent of equity across all markets.
+    max_margin_pct: float = 50.0
+    # "bot" closes only positions this bot opened; "account" closes everything.
+    flatten_scope: str = "bot"
 
     poll_seconds: float = 15.0
     log_level: str = "INFO"
@@ -120,6 +124,10 @@ class Config:
             raise ConfigError("FP_MARGIN_MODE must be 'cross' or 'isolated'.")
         if self.max_daily_loss_pct <= 0:
             raise ConfigError("FP_MAX_DAILY_LOSS_PCT must be greater than zero.")
+        if self.flatten_scope not in {"bot", "account"}:
+            raise ConfigError("FP_FLATTEN_SCOPE must be 'bot' or 'account'.")
+        if not 0 < self.max_margin_pct <= 100:
+            raise ConfigError("FP_MAX_MARGIN_PCT must be between 0 and 100.")
         if self.poll_seconds <= 0:
             raise ConfigError("FP_POLL_SECONDS must be greater than zero.")
 
@@ -144,6 +152,8 @@ _ENV_KEYS = {
     "max_daily_loss_pct": "FP_MAX_DAILY_LOSS_PCT",
     "max_daily_trades": "FP_MAX_DAILY_TRADES",
     "min_daily_room_pct": "FP_MIN_DAILY_ROOM_PCT",
+    "max_margin_pct": "FP_MAX_MARGIN_PCT",
+    "flatten_scope": "FP_FLATTEN_SCOPE",
     "poll_seconds": "FP_POLL_SECONDS",
     "log_level": "FP_LOG_LEVEL",
     "state_file": "FP_STATE_FILE",
@@ -157,6 +167,7 @@ _FLOAT_FIELDS = {
     "leverage",
     "max_daily_loss_pct",
     "min_daily_room_pct",
+    "max_margin_pct",
     "poll_seconds",
 }
 _INT_FIELDS = {"ema_fast", "ema_slow", "atr_period", "max_daily_trades"}

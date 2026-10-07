@@ -65,7 +65,18 @@ risk budget, and places orders with broker-side TP/SL.
 * Strategies emit a signal only on the crossing candle and only from **closed**
   candles. Keep the strategy interface in `mfpbot/strategy/base.py`.
 * Risk guards live in `mfpbot/risk/`. Two layers: bot-side daily caps and
-  account-side room from the API risk snapshot.
+  account-side room from the API risk snapshot. `RiskState` also lives in
+  `mfpbot/state.py` alongside the persisted `BotState`.
+* **Ownership safety:** the bot records the `position_id` returned by each fill
+  in `BotState.owned_position_ids` and only ever closes/reverses positions it
+  owns. `_prune_owned` drops IDs once a position is gone (TP/SL/manual close).
+  `FP_FLATTEN_SCOPE` (`bot` default, or `account`) controls kill-switch scope.
+* A competition account's risk snapshot may report `daily_loss_room` and
+  `max_drawdown_room` as `null`; the guards treat `null` as "no limit", so the
+  bot-side daily caps are the effective protection there.
+* `save_state` must never raise — a failed write logs and degrades to a direct
+  write, because a state-file error must not kill the trading loop.
 * Tests must exercise real code paths. `tests/conftest.py` starts a real
   `ThreadingHTTPServer` stub; do not replace it with mocks.
-* Never log or commit API keys.
+* Never log or commit API keys. The live key lives only in `.env` (git-ignored,
+  mode 600); load it with `load_dotenv_file()` from `mfpbot.config`.

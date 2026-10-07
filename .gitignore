@@ -3,6 +3,7 @@
 *.local.yaml
 config.yaml
 bot_state.json
+.mfpbot_state.json
 *.log
 
 # Python
