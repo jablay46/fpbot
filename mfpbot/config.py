@@ -43,6 +43,14 @@ class Config:
     ema_fast: int = 12
     ema_slow: int = 26
     atr_period: int = 14
+    # Donchian breakout: channel lookback, optional ADX regime floor and EMA
+    # trend filter (0 disables each).
+    donchian_period: int = 20
+    regime_adx_min: float = 0.0
+    trend_ema: int = 0
+    # Supertrend: ATR period and band multiplier.
+    supertrend_period: int = 10
+    supertrend_mult: float = 3.0
 
     risk_per_trade_pct: float = 0.5
     atr_stop_mult: float = 2.0
@@ -150,6 +158,16 @@ class Config:
                 raise ConfigError(f"market ID {mid!r} must look like 'provider|COIN'.")
         if self.ema_fast >= self.ema_slow:
             raise ConfigError("FP_EMA_FAST must be smaller than FP_EMA_SLOW.")
+        if self.donchian_period < 1:
+            raise ConfigError("FP_DONCHIAN_PERIOD must be >= 1.")
+        if self.trend_ema < 0:
+            raise ConfigError("FP_TREND_EMA must be >= 0.")
+        if self.regime_adx_min < 0:
+            raise ConfigError("FP_REGIME_ADX_MIN must be >= 0.")
+        if self.supertrend_period < 1:
+            raise ConfigError("FP_SUPERTREND_PERIOD must be >= 1.")
+        if self.supertrend_mult <= 0:
+            raise ConfigError("FP_SUPERTREND_MULT must be greater than zero.")
         if self.risk_per_trade_pct <= 0:
             raise ConfigError("FP_RISK_PER_PCT must be greater than zero.")
         if self.leverage <= 0:
@@ -208,6 +226,11 @@ _ENV_KEYS = {
     "ema_fast": "FP_EMA_FAST",
     "ema_slow": "FP_EMA_SLOW",
     "atr_period": "FP_ATR_PERIOD",
+    "donchian_period": "FP_DONCHIAN_PERIOD",
+    "regime_adx_min": "FP_REGIME_ADX_MIN",
+    "trend_ema": "FP_TREND_EMA",
+    "supertrend_period": "FP_SUPERTREND_PERIOD",
+    "supertrend_mult": "FP_SUPERTREND_MULT",
     "risk_per_trade_pct": "FP_RISK_PER_PCT",
     "atr_stop_mult": "FP_ATR_STOP_MULT",
     "take_profit_rr": "FP_TP_RR",
@@ -240,9 +263,14 @@ _FLOAT_FIELDS = {
     "max_total_drawdown_pct",
     "max_margin_pct",
     "max_entry_drift_atr",
+    "regime_adx_min",
+    "supertrend_mult",
     "poll_seconds",
 }
-_INT_FIELDS = {"ema_fast", "ema_slow", "atr_period", "max_daily_trades"}
+_INT_FIELDS = {
+    "ema_fast", "ema_slow", "atr_period", "max_daily_trades",
+    "donchian_period", "trend_ema", "supertrend_period",
+}
 _BOOL_FIELDS = {"dry_run", "ack_no_drawdown_guard", "allow_fresh_state"}
 _LIST_FIELDS = {"symbols"}
 

@@ -24,6 +24,8 @@ log = logging.getLogger("mfpbot.stream")
 
 # Request id reserved for app-level heartbeat pings; subscriptions use 1..n.
 PING_REQUEST_ID = 9000
+# Request id reserved for one-shot ``candles.history`` requests.
+HISTORY_REQUEST_ID = 9001
 
 
 @dataclass
@@ -218,6 +220,72 @@ class MarketDataStream:
         if group.get("providers"):
             payload["providers"] = group["providers"]
         return json.dumps({"op": "sub", "id": request_id, "channel": "candles", "payload": payload})
+
+    def _history_frame(
+        self,
+        request_id: int,
+        provider: str,
+        symbol: str,
+        interval: str,
+        limit: int,
+        start_time: Optional[int],
+        end_time: Optional[int],
+        price_kind: Optional[str],
+    ) -> str:
+        payload: dict = {"provider": provider, "symbol": symbol, "interval": interval, "limit": limit}
+        if start_time is not None:
+            payload["startTime"] = start_time
+        if end_time is not None:
+            payload["endTime"] = end_time
+        if price_kind is not None:
+            payload["priceKind"] = price_kind
+        return json.dumps({"op": "req", "id": request_id, "method": "candles.history", "payload": payload})
+
+    async def fetch_history(
+        self,
+        provider: str,
+        symbol: str,
+        *,
+        interval: Optional[str] = None,
+        limit: int = 500,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        price_kind: Optional[str] = None,
+    ) -> list[Candle]:
+        """Fetch a historical candle window for one provider/symbol.
+
+        Uses the ``candles.history`` request over a short-lived connection. The
+        provider caps how much it returns ("bounded by provider availability and
+        retention"), so page by moving ``end_time`` backwards through the window
+        you want; an empty or short list is a normal outcome, not an error.
+        """
+        interval = interval or self.interval
+        request_id = HISTORY_REQUEST_ID
+        async with websockets.connect(
+            self.url, open_timeout=20, ping_interval=None, max_size=4 * 1024 * 1024
+        ) as ws:
+            await ws.send(self._history_frame(request_id, provider, symbol, interval, limit, start_time, end_time, price_kind))
+            candles: list[Candle] = []
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=self.idle_timeout)
+                frame = json.loads(raw)
+                if frame.get("id") is not None and frame.get("id") != request_id:
+                    continue
+                op = frame.get("op")
+                if op in ("sub_ok", "events", "snapshot_end"):
+                    continue
+                if "result" in frame:
+                    for ev in frame.get("result") or []:
+                        if isinstance(ev, dict) and ev.get("type") == "candle":
+                            candles.append(Candle.from_event(ev))
+                        elif isinstance(ev, dict) and "openTime" in ev:
+                            candles.append(Candle.from_event(ev))
+                    return candles
+                if op in ("error", "err", "req_err"):
+                    error = frame.get("error")
+                    raise RuntimeError(f"candles.history failed for {provider}|{symbol}: {error}")
+                if op == "end":
+                    return candles
 
     async def candles(self) -> AsyncIterator[Candle]:
         """Yield candle events forever, reconnecting on transport failures."""
