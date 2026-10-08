@@ -62,7 +62,11 @@ risk budget, and places orders with broker-side TP/SL.
   the `client_order_id` *only when it was supplied at placement* (orders placed
   by hand on the website carry `client_order_id: null`). `find_order_by_client_id`
   therefore verifies the field on the returned order and treats a mismatch as
-  "not found". `close_position` is a blocking POST that returns an ack; execution
+  "not found". The lookup scans the *whole* returned list (paging via the
+  cursor) rather than trusting row[0], and retries without the filter if the
+  filtered reply is empty — a server that ignores the filter must never hide a
+  live, in-flight entry (which the bot would re-place as a duplicate).
+  `close_position` is a blocking POST that returns an ack; execution
   is asynchronous, so the caller confirms via `_wait_position_gone`.
 * **Verified live (2026-10-08):** the candle WebSocket snapshot arrives with
   `isFinal: true` for completed history bars and `isFinal: false` for the

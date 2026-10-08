@@ -112,6 +112,10 @@ class StubState:
     # When true, ignore the client_order_id filter and return every order (a
     # misbehaving/regressed server), to exercise the client-side verification.
     ignore_order_filter: bool = False
+    # When > 0, GET /v1/orders paginates with a cursor: it returns at most this
+    # many rows per page as {"items": [...], "next_cursor": ...}. Exercises the
+    # client's own full-list scan when a server filter cannot be trusted.
+    order_page_size: int = 0
     # Number of extra polls during which a closed position still appears open.
     slow_close_polls: int = 0
     # Number of close requests to reject (422, non-retryable) before accepting.
@@ -282,6 +286,15 @@ class _Handler(BaseHTTPRequestHandler):
             wanted = query.get("client_order_id", [None])[0]
             if wanted and not self.state.ignore_order_filter:
                 rows = [o for o in rows if o.get("client_order_id") == wanted]
+            page_size = self.state.order_page_size
+            if page_size and page_size > 0:
+                cursor = query.get("cursor", [None])[0]
+                start = int(cursor) if cursor else 0
+                page = rows[start:start + page_size]
+                next_start = start + len(page)
+                next_cursor = str(next_start) if next_start < len(rows) else None
+                self._send(200, {"data": {"items": page, "next_cursor": next_cursor}})
+                return
             self._send(200, {"data": rows})
         elif path.startswith("/v1/orders/"):
             order_id = path.rsplit("/", 1)[-1]

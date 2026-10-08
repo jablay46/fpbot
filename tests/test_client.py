@@ -97,6 +97,39 @@ def test_find_order_by_client_id_rejects_mismatch(client):
     assert c.find_order_by_client_id("coid-other", account_id="acct-1") is None
 
 
+def test_find_order_by_client_id_does_not_trust_the_first_row(client):
+    """A misbehaving server that ignores the filter must not hide the real order.
+
+    Returning the first row (or None on row[0] mismatch) would make the bot
+    treat a live, unfilled order as never accepted and drop its pending marker —
+    exactly the duplicate-entry risk. The lookup must scan for the id.
+    """
+    c, state = client
+    for coid in ("coid-a", "coid-b", "coid-target"):
+        c.place_order(
+            {"account_id": "acct-1", "market_id": "binance|BTCUSDT", "side": "buy",
+             "size": 0.01, "leverage": 2, "margin_mode": "cross",
+             "client_order_id": coid},
+        )
+    state.ignore_order_filter = True  # every order comes back
+    found = c.find_order_by_client_id("coid-target", account_id="acct-1")
+    assert found is not None and found["client_order_id"] == "coid-target"
+
+
+def test_find_order_by_client_id_pages_through_the_full_list(client):
+    """A cursor-paginated server must still be scanned end to end."""
+    c, state = client
+    for i in range(5):
+        c.place_order(
+            {"account_id": "acct-1", "market_id": "binance|BTCUSDT", "side": "buy",
+             "size": 0.01, "leverage": 2, "margin_mode": "cross",
+             "client_order_id": f"coid-{i}"},
+        )
+    state.order_page_size = 2  # items + next_cursor
+    found = c.find_order_by_client_id("coid-4", account_id="acct-1")
+    assert found is not None and found["client_order_id"] == "coid-4"
+
+
 def test_public_client_without_key(stub_server):
     base_url, state = stub_server
     c = MfpClient("", base_url, sleep=lambda _s: None)

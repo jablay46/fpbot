@@ -431,6 +431,44 @@ def test_halted_watchdog_survives_a_failing_pending_lookup(stub_server, tmp_path
     assert bot.state.risk.halted
 
 
+def test_server_ignoring_filter_never_duplicates_a_live_order(stub_server, tmp_path):
+    """A filter-ignoring server must not make the bot re-place a live order.
+
+    The reply to the entry POST is lost, and the lookup server ignores the
+    client_order_id filter (so the first row is an unrelated order). If the
+    lookup trusted row[0] it would report "not accepted", clear the pending
+    marker, and re-enter on the next signal — a duplicate position on a live
+    account. The whole list must be scanned instead.
+    """
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    # An unrelated pre-existing order that comes back first.
+    state.orders.append({
+        "id": "order-0", "account_id": "acct-1", "market_id": "binance|ETHUSDT",
+        "side": "buy", "size": 0.01, "client_order_id": "someone-else",
+        "status": "filled",
+    })
+    state.drop_order_response = True
+    state.ignore_order_filter = True
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert bot.state.pending_entries == {}
+    assert bot.state.owned_position_ids == ["pos-1"]
+
+    # Feed another fresh crossover: no second (distinct) entry may be sent. The
+    # retried POSTs of the first entry all carry the same idempotency key, so
+    # count distinct client_order_ids, not raw requests.
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms + 60_000
+    )
+    placed = [r for r in state.requests if r["path"] == "/v1/orders" and r["method"] == "POST"]
+    distinct_ids = {r["body"].get("client_order_id") for r in placed}
+    assert len(distinct_ids) == 1
+
+
 def test_pending_entries_survive_restart(stub_server, tmp_path):
     """Pending entries are persisted and reloaded for reconciliation."""
     now_ms = 1_700_000_000_000 + 1000 * 60_000
