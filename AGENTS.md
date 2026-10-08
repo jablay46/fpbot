@@ -86,3 +86,18 @@ risk budget, and places orders with broker-side TP/SL.
 * A dry run uses `<FP_STATE_FILE>.dryrun` (`Config.state_path`) so it never
   reads or writes live state.
 * Entry drift is capped at `min(5% of close, FP_MAX_ENTRY_DRIFT_ATR * ATR)`.
+* **Concurrency rule:** never hold `Bot._lock` across network I/O. The candle
+  handler makes blocking REST calls off the event loop; holding the lock across
+  them would stall the watchdog's kill check. The halt flag is set under a short
+  lock (no I/O) and the flatten runs outside it, guarded by `_flatten_lock`.
+  A kill that lands mid-entry stops the order (`_place_entry` re-checks
+  `halted` under the lock); a fill that still arrives after a halt is flattened
+  by `_finish_entry`.
+* **Pending entries:** `BotState.pending_entries` is a dict keyed by
+  `client_order_id`, never a single slot. A pending marker is cleared only when
+  the order reaches a terminal state; a still-working order stays pending so the
+  lookup is retried instead of risking a duplicate.
+* **Ownership is released only on confirmation:** `_close_position` does not
+  forget the id on submit; `_prune_owned`/`_flatten` drop it once the exchange
+  reports the position gone. The flatten verifies the result and the watchdog
+  retries it every tick while halted.
