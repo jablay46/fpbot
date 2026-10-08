@@ -12,9 +12,11 @@ risk budget, and places orders with broker-side TP/SL.
 
 ## Environment and commands
 
-* Python 3.10+ (developed on 3.13). Dependencies: `requests`, `websockets`,
-  `python-dotenv`; tests use `pytest`.
+* Python 3.10+ (developed on 3.13). Dependencies: `requests`, `websockets`
+  (pinned in `requirements.txt`); tests use `pytest` and `pip-audit`
+  (`requirements-dev.txt`).
 * Install: `pip install -r requirements-dev.txt`
+* Audit dependencies: `pip-audit -r requirements.txt`
 * Run tests: `python -m pytest -q` (tests use a local HTTP stub server, no
   network and no API key required).
 * Discover markets: `python -m mfpbot markets`
@@ -79,4 +81,8 @@ risk budget, and places orders with broker-side TP/SL.
 * Tests must exercise real code paths. `tests/conftest.py` starts a real
   `ThreadingHTTPServer` stub; do not replace it with mocks.
 * Never log or commit API keys. The live key lives only in `.env` (git-ignored,
-  mode 600); load it with `load_dotenv_file()` from `mfpbot.config`.
+  mode 600); `load_dotenv_file()` from `mfpbot.config` parses it with the
+  standard library (no `python-dotenv` dependency).
+* A dry run uses `<FP_STATE_FILE>.dryrun` (`Config.state_path`) so it never
+  reads or writes live state.
+* Entry drift is capped at `min(5% of close, FP_MAX_ENTRY_DRIFT_ATR * ATR)`.

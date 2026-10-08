@@ -8,13 +8,12 @@ version = "0.1.0"
 description = "Automated trading bot for the MyFundedPerps developer API"
 requires-python = ">=3.10"
 dependencies = [
-    "requests>=2.31",
-    "websockets>=12.0",
-    "python-dotenv>=1.0",
+    "requests==2.34.2",
+    "websockets==17.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest==8.4.2", "pip-audit==2.9.0"]
 
 [project.scripts]
 mfpbot = "mfpbot.cli:main"
