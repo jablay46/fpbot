@@ -27,16 +27,91 @@ step and stays with you.
 
 ## Install
 
+### Prerequisites
+
+* **Python 3.10+** (3.11+ recommended; developed on 3.13). Check with:
+  `python3 --version`
+* **Git**, for cloning and updating the repo.
+* **pip** (ships with Python) and a terminal. On Debian/Ubuntu you may need
+  `sudo apt install python3-venv git` first.
+* Only two runtime dependencies (`requests`, `websockets`, pinned in
+  `requirements.txt`); tests add `pytest` and `pip-audit`.
+
+### 1. Clone the repo
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt   # or: pip install -e .
+git clone https://github.com/jablay46/fpbot.git
+cd fpbot
 ```
+
+Staying on `main` is fine for running the bot. If you were given a feature
+branch to try, switch after cloning:
+
+```bash
+git checkout <branch-name>
+```
+
+### 2. Create and activate a virtual environment
+
+Using a venv keeps the bot's packages isolated from your system Python:
+
+```bash
+# Linux / macOS
+python3 -m venv .venv && source .venv/bin/activate
+
+# Windows (PowerShell)
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+Your prompt should now show `(.venv)`. Re-activate it in every new terminal
+before running the bot.
+
+### 3. Install the bot
+
+```bash
+# Recommended: runtime + test/dev tools
+pip install -r requirements-dev.txt
+
+# Minimal: runtime only
+pip install -r requirements.txt
+
+# Alternative: install as an editable package (adds the `mfpbot` command)
+pip install -e .
+```
+
+### 4. Verify the install
+
+```bash
+python -m pytest -q        # test suite; expect all green, no key needed
+python -m mfpbot markets --filter BTC   # public call, confirms networking works
+```
+
+### Updating later
+
+```bash
+cd fpbot
+git pull
+pip install -r requirements-dev.txt   # picks up any new pins
+```
+
+> The bot never needs root/`sudo`. If `pip` complains about an
+> "externally managed environment" (Debian/Ubuntu), it means you forgot to
+> activate the venv — do not use `--break-system-packages` to work around it.
 
 ## Configure
 
+1. **Get an API key.** Sign in at
+   [myfundedperpetuals.com](https://myfundedperpetuals.com), open
+   Settings → API Keys, and create a key: a free `fp_test_` sandbox key to
+   start with, a `fp_live_` key only when you are ready for a real challenge
+   account. Each key only works on its own host.
+2. **Copy the template and fill it in:**
+
 ```bash
 cp .env.example .env
-# edit .env and set FP_API_KEY (a fp_test_ key to start) and FP_ACCOUNT_ID
+# edit .env: set FP_API_KEY (a fp_test_ key to start) and FP_ACCOUNT_ID
+chmod 600 .env   # optional but recommended: owner-read-only
 ```
 
 Key settings (see `.env.example` for all of them):
