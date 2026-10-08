@@ -71,7 +71,9 @@ class RiskManager:
         """False when the account reports no usable room and the policy is halt.
 
         A competition account can report ``daily_loss_room`` / ``max_drawdown_room``
-        as null. Fail closed unless the operator opted into bot-only limits.
+        as null. Fail closed only when *both* are absent — a partial snapshot still
+        carries a usable guard, and :meth:`check_kill` enforces whichever figure is
+        present. The operator can opt into bot-only limits to always continue.
         """
         if self.missing_room_policy != "halt":
             if self.missing_room_policy == "bot-only" and state.missing_room_warned_day != state.day:
@@ -82,11 +84,10 @@ class RiskManager:
             return True
         daily_room = account_risk.get("daily_loss_room")
         dd_room = account_risk.get("max_drawdown_room")
-        if daily_room is None or dd_room is None:
+        if daily_room is None and dd_room is None:
             log.error(
-                "account risk snapshot is missing room figures (daily_loss_room=%s, "
-                "max_drawdown_room=%s); refusing new entries (FP_ON_MISSING_ROOM=halt)",
-                daily_room, dd_room,
+                "account risk snapshot is missing all room figures (daily_loss_room=None, "
+                "max_drawdown_room=None); refusing new entries (FP_ON_MISSING_ROOM=halt)"
             )
             return False
         return True

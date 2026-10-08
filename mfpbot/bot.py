@@ -32,8 +32,10 @@ TERMINAL_ORDER_STATES = {"filled", "rejected", "canceled", "cancelled", "expired
 # last closed candle and the quote; used to skip entries on a stale/broken feed.
 MAX_ENTRY_DRIFT = 0.05
 # A candle is only acted on if its close is within this many intervals of now;
-# older bars are history/backfill and must never trigger a live order.
-FRESHNESS_INTERVALS = 1.5
+# older bars are history/backfill and must never trigger a live order. Kept at a
+# full interval so a slightly late bar (exchange close-time skew) is not treated
+# as stale, while backfilled bars still cannot trade.
+FRESHNESS_INTERVALS = 1.0
 # Retry delays (seconds) when a fresh candle hits a transient REST error.
 FRESH_CANDLE_RETRY_DELAYS = (2.0, 5.0)
 # How long to wait for a submitted close to actually leave the open book before
@@ -185,14 +187,20 @@ class Bot:
             )
             return {"id": "dry-run", "status": "filled", "client_order_id": client_order_id}
 
-        # Record the intent (and the positions we must not mistake for ours)
-        # before sending, so a lost reply or crash can be reconciled later.
+        # Snapshot the positions we must not mistake for ours before sending. If
+        # this fails we cannot tell our new position from a pre-existing one, so
+        # abort rather than risk adopting a manual position (the P4 bug).
+        try:
+            pre_position_ids = self._market_position_ids(market_id)
+        except ApiError as exc:
+            log.warning("%s: cannot snapshot positions before entry (%s); not sending", market_id, exc)
+            return None
         pending = PendingEntry(
             market_id=market_id,
             client_order_id=client_order_id,
             idempotency_key=idempotency_key,
             sent_at=self.clock(),
-            pre_position_ids=self._market_position_ids(market_id),
+            pre_position_ids=pre_position_ids,
         )
         with self._lock:
             # A kill that landed between the signal and here must win: the halt
@@ -209,7 +217,8 @@ class Bot:
         except ApiError as exc:
             return self._recover_lost_order(market_id, pending, exc)
 
-        return self._finish_entry(market_id, created, pending)
+        filled, _ = self._finish_entry(market_id, created, pending)
+        return filled
 
     def _recover_lost_order(
         self, market_id: str, pending: PendingEntry, exc: ApiError
@@ -232,19 +241,24 @@ class Bot:
             save_state(self.cfg.state_path, self.state)
             return None
         log.info("%s: reconciled order %s after a lost reply", market_id, pending.client_order_id)
-        return self._finish_entry(market_id, found, pending)
+        filled, _ = self._finish_entry(market_id, found, pending)
+        return filled
 
     def _clear_pending(self, client_order_id: str) -> None:
         self.state.pending_entries.pop(client_order_id, None)
 
     def _finish_entry(
         self, market_id: str, created: dict[str, Any], pending: PendingEntry
-    ) -> Optional[dict[str, Any]]:
+    ) -> tuple[Optional[dict[str, Any]], bool]:
         """Await the fill, adopt the position, and clear the pending marker.
 
-        Only this entry's own pending marker is cleared, never another market's.
+        Returns ``(filled_order, resolved)``. ``resolved`` is False when the order
+        never reached a terminal state within the wait: the pending marker is then
+        kept so the lookup is retried instead of silently dropping a live order
+        (which would allow a duplicate). Only this entry's own marker is cleared.
         """
-        filled = self._await_order(market_id, created)
+        final = self._await_order(market_id, created)
+        filled = final if final.get("status") == "filled" else None
         if filled is not None:
             self._adopt_position(market_id, pending.pre_position_ids)
             if self.state.risk.halted:
@@ -253,9 +267,16 @@ class Bot:
                 # is never left unmanaged on a halted account.
                 log.warning("%s: entry filled after halt; flattening the new position", market_id)
                 self._flatten()
-        self._clear_pending(pending.client_order_id)
+        resolved = final.get("status") in TERMINAL_ORDER_STATES
+        if resolved:
+            self._clear_pending(pending.client_order_id)
+        else:
+            log.warning(
+                "%s: order %s is still %s; keeping it pending",
+                market_id, final.get("id"), final.get("status"),
+            )
         save_state(self.cfg.state_path, self.state)
-        return filled
+        return filled, resolved
 
     def _reconcile_pending_entry(self) -> bool:
         """Resolve every outstanding entry from a previous send.
@@ -296,19 +317,22 @@ class Bot:
                 save_state(self.cfg.state_path, self.state)
                 continue
             log.info("%s: resolving pending entry %s", pending.market_id, pending.client_order_id)
-            filled = self._finish_entry(pending.market_id, found, pending)
-            if filled is not None:
+            filled, resolved = self._finish_entry(pending.market_id, found, pending)
+            if not resolved:
+                busy = True
+            elif filled is not None:
                 self.risk.record_entry(self.state.risk)
                 save_state(self.cfg.state_path, self.state)
         return busy
 
     def _market_position_ids(self, market_id: str) -> list[str]:
-        """IDs of currently open positions in one market (pre-entry snapshot)."""
-        try:
-            return [p["id"] for p in self._open_positions() if p.get("market_id") == market_id]
-        except ApiError as exc:
-            log.warning("%s: could not snapshot positions before entry: %s", market_id, exc)
-            return []
+        """IDs of currently open positions in one market (pre-entry snapshot).
+
+        Raises ``ApiError`` if the snapshot cannot be taken, so the caller can
+        abort the entry instead of proceeding with an empty set (which would let
+        the adoption step mistake a pre-existing position for ours).
+        """
+        return [p["id"] for p in self._open_positions() if p.get("market_id") == market_id]
 
     def _adopt_position(
         self, market_id: str, pre_position_ids: Optional[list[str]] = None, timeout: float = 8.0
@@ -366,7 +390,12 @@ class Bot:
                 pid for pid in self.state.owned_position_ids if pid in live
             ]
 
-    def _await_order(self, market_id: str, created: dict[str, Any], timeout: float = 20.0) -> Optional[dict[str, Any]]:
+    def _await_order(self, market_id: str, created: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
+        """Poll an order until it reaches a terminal state or the wait expires.
+
+        Returns the last known order (which may still be non-terminal), so the
+        caller can decide whether to keep the entry pending.
+        """
         status = created.get("status")
         order_id = created.get("id")
         deadline = time.monotonic() + timeout
@@ -383,9 +412,11 @@ class Bot:
             created = current
         if status == "filled":
             log.info("%s: order filled %s %s", market_id, created.get("side"), fmt(created.get("filled_size")))
-            return created
-        log.warning("%s: order %s ended in status %s", market_id, order_id, status)
-        return None
+        elif status not in TERMINAL_ORDER_STATES:
+            log.warning("%s: order %s still %s after the wait", market_id, order_id, status)
+        else:
+            log.warning("%s: order %s ended in status %s", market_id, order_id, status)
+        return created
 
     def _wait_position_gone(self, position_id: str, timeout: float = 5.0) -> bool:
         """Poll until a closed position disappears from the open list."""
@@ -748,18 +779,20 @@ class Bot:
                 self._retry_flatten_while_halted()
             return True
         # Either not halted, or the UTC day rolled over: fall through so
-        # roll_day clears the halt and the new day is guarded normally. Fetch
-        # the snapshot and reconcile outside the lock (both make REST calls).
+        # roll_day clears the halt and the new day is guarded normally. The kill
+        # check runs before the pending-entry reconcile: a kill must never wait
+        # on an order lookup (reconcile makes REST calls). Fetch the snapshot
+        # outside the lock; it is the only I/O the kill decision needs.
         account_risk = self._refresh_account()
-        self._reconcile_pending_entry()
         with self._lock:
             killed, reason = self._check_kill_locked(account_risk)
-        if not killed:
-            return False
-        # Flatten outside the lock so the watchdog is never blocked by it.
-        log.error("watchdog kill switch: %s", reason)
-        self._flatten()
-        return True
+        if killed:
+            # Flatten outside the lock so the watchdog is never blocked by it.
+            log.error("watchdog kill switch: %s", reason)
+            self._flatten()
+            return True
+        self._reconcile_pending_entry()
+        return False
 
     async def _watchdog(self) -> None:
         """Poll the account between candles so guards fire even with no signal.
@@ -857,6 +890,10 @@ class Bot:
                 return
             if not self._is_fresh(candle):
                 self.state.last_processed_open_time[market_id] = candle.open_time
+                log.debug(
+                    "%s: history/backfill candle %s skipped (not fresh)",
+                    market_id, candle.open_time,
+                )
                 return
         self._handle_fresh_candle(market_id, candle)
 

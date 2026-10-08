@@ -64,6 +64,16 @@ def test_missing_room_halt_blocks_entry_without_flatten():
     assert not decision.flatten
 
 
+def test_partial_room_is_enough_when_policy_is_halt():
+    """Only a *complete* absence of room figures should fail closed."""
+    mgr = _manager(missing_room_policy="halt")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.can_enter(
+        state, equity=100000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=5000.0)
+    )
+    assert decision.allowed
+
+
 def test_missing_room_bot_only_allows_entry():
     mgr = _manager(missing_room_policy="bot-only")
     state = RiskState(day="2026-01-01", day_start_equity=100000)

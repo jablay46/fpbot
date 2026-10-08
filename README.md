@@ -143,7 +143,9 @@ trigger even if the bot is offline.
   it is explicitly allowed to keep going on bot-side caps (`bot-only`).
 * **Kill switch runs even while holding a position** — a watchdog polls the
   account between candles, so the daily loss cap and room floor fire without
-  waiting for the next signal.
+  waiting for the next signal. It keeps running for the life of the bot (the
+  halt clears on the next UTC day) and, while halted, retries flattening until
+  every bot-owned position is confirmed closed.
 * **Portfolio margin cap** — total position margin across all markets cannot
   exceed `FP_MAX_MARGIN_PCT` of equity; new entries are skipped once it is hit.
 * **Manual positions are safe** — the bot tracks the positions it opened and
@@ -162,8 +164,10 @@ trigger even if the bot is offline.
 * `429`/`5xx` responses are retried with jittered backoff and `Retry-After`. A
   transient error while handling a fresh candle is retried, and the candle is
   only marked processed once it is actually handled.
-* Blocking REST work runs off the WebSocket event loop, so heartbeats and the
-  kill-switch watchdog keep running during order polling.
+* Blocking REST work runs off the WebSocket event loop, and the state lock is
+  never held across network I/O. The kill-switch watchdog therefore fires
+  promptly even while a candle handler is mid-request, and a kill that lands
+  mid-entry stops the order from being sent.
 * State (daily counters, last processed candle, last entry ID) is persisted to
   `FP_STATE_FILE` so a restart does not double-count entries. An entry whose
   reply was lost is recorded before sending and reconciled on startup, on the

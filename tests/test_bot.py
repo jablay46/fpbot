@@ -847,6 +847,78 @@ def test_fill_after_halt_is_flattened(stub_server, tmp_path, monkeypatch):
     assert bot.state.owned_position_ids == []
 
 
+def test_entry_aborted_when_position_snapshot_fails(stub_server, tmp_path):
+    """A failed pre-entry snapshot must abort the entry, not risk adopting a
+    manual position as if it were ours."""
+    bot, state = build_bot(stub_server, tmp_path)
+    state.fail_times["/v1/positions?account_id=acct-1&status=open"] = 999
+
+    result = bot._place_entry("binance|BTCUSDT", "buy", 0.01, 100.0, 98.0, 104.0)
+
+    assert result is None
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+    assert bot.state.pending_entries == {}
+
+
+def test_candle_older_than_one_interval_is_not_traded(stub_server, tmp_path):
+    """A candle that closed more than one interval ago is history, not a signal."""
+    bot, state = build_bot(stub_server, tmp_path)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    # The final candle closes 1.5 intervals before "now": must be skipped.
+    closes = scale(UP_CLOSES, QUOTES["binance|BTCUSDT"])
+    start = now_ms - 150_000 - (len(closes) - 1) * 60_000
+    for candle in make_candles(closes, start_time=start, symbol="BTCUSDT"):
+        bot._process_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_kill_check_does_not_wait_for_pending_reconcile(stub_server, tmp_path):
+    """The kill must fire even while an order lookup is slow/pending."""
+    import time
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.pending_entries["mfpbot:binance|BTCUSDT:abc"] = PendingEntry(
+        market_id="binance|BTCUSDT",
+        client_order_id="mfpbot:binance|BTCUSDT:abc",
+        idempotency_key="idem-1",
+        sent_at=0.0,
+        pre_position_ids=[],
+    )
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.slow_paths = {"/v1/orders": 1.0}
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+
+    started = time.monotonic()
+    fired = bot.check_kill_now()
+    elapsed = time.monotonic() - started
+
+    assert fired
+    assert elapsed < 0.5, f"kill waited {elapsed:.2f}s on the pending reconcile"
+    assert bot.state.risk.halted
+
+
+def test_non_terminal_order_keeps_pending_entry(stub_server, tmp_path, monkeypatch):
+    """An order still working after the wait stays pending (never dropped)."""
+    bot, state = build_bot(stub_server, tmp_path)
+    pending = PendingEntry(
+        market_id="binance|BTCUSDT", client_order_id="coid-1",
+        idempotency_key="idem-1", sent_at=0.0, pre_position_ids=[],
+    )
+    bot.state.pending_entries["coid-1"] = pending
+    monkeypatch.setattr(bot, "_await_order", lambda *a, **k: {"id": "order-1", "status": "new"})
+
+    filled, resolved = bot._finish_entry(
+        "binance|BTCUSDT", {"id": "order-1", "status": "new"}, pending
+    )
+
+    assert filled is None
+    assert resolved is False
+    assert "coid-1" in bot.state.pending_entries
+
+
 def test_history_replay_is_not_traded(stub_server, tmp_path):
     """300 historical candles with a crossover inside must not trade."""
     bot, state = build_bot(stub_server, tmp_path)
