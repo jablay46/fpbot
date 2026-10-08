@@ -326,7 +326,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ar = sub.add_parser("archive", help="Record live candles to a JSONL file")
     p_ar.add_argument("--symbols", nargs="+", required=True, help="market ids like binance|BTCUSDT")
-    p_ar.add_argument("--timeframe", default="15m")
+    p_ar.add_argument("--timeframe", default="4h",
+                      help="Candle interval (default 4h, matching the bot)")
     p_ar.add_argument("--history-limit", type=int, default=300)
     p_ar.add_argument("--out", required=True, help="Output JSONL file")
     p_ar.add_argument("--max-candles", type=int, help="Stop after this many bars (for testing)")

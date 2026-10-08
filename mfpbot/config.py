@@ -47,7 +47,11 @@ class Config:
     symbols: list[str] = field(default_factory=list)
 
     strategy: str = "donchian_breakout"
-    timeframe: str = "15m"
+    # 4h, not 15m: on real MFP candles 15m is net-negative for every shipped
+    # strategy (noise > edge, even gross), while 4h gives donchian a positive,
+    # walk-forward-confirmed edge (BTC MAR 0.73, PF 1.19, 100% folds).
+    # See the README "Choosing a timeframe" section.
+    timeframe: str = "4h"
     ema_fast: int = 12
     ema_slow: int = 26
     atr_period: int = 14

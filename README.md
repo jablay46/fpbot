@@ -123,7 +123,7 @@ Key settings (see `.env.example` for all of them):
 | `FP_ACCOUNT_ID` | Challenge account to trade; empty = first active account |
 | `FP_SYMBOLS` | Comma-separated market IDs to trade (multi-asset). Max 32 |
 | `FP_MARKET_ID` | Single market fallback used when `FP_SYMBOLS` is empty |
-| `FP_TIMEFRAME` | Candle interval, e.g. `15m` |
+| `FP_TIMEFRAME` | Candle interval (default `4h`; see *Choosing a timeframe*) |
 | `FP_RISK_PER_PCT` | Percent of equity risked between entry and stop |
 | `FP_ATR_STOP_MULT` | Stop distance as a multiple of ATR |
 | `FP_TP_RR` | Take profit as a multiple of the stop distance |
@@ -250,7 +250,7 @@ to get a dataset:
 ```bash
 # A) Record live candles from the stream to a JSONL archive (run alongside the
 #    bot, or on its own). Resumable and de-duplicated by bar open time.
-python -m mfpbot archive --symbols binance|BTCUSDT --timeframe 15m --out data/btc15m.jsonl
+python -m mfpbot archive --symbols binance|BTCUSDT --timeframe 4h --out data/btc4h.jsonl
 
 # B) Or use any OHLCV CSV/JSONL you already have (e.g. an exchange export).
 ```
@@ -259,7 +259,7 @@ Then compare every strategy over the same bars, net of the firm's published
 costs, and validate out-of-sample:
 
 ```bash
-python -m mfpbot backtest --bars data/btc15m.jsonl \
+python -m mfpbot backtest --bars data/btc4h.jsonl \
   --equity 100000 --risk-pct 0.5 \
   --max-daily-loss-pct 3 --max-total-drawdown-pct 3 \
   --walk-forward 5
@@ -291,6 +291,38 @@ constraints it will actually trade under. When both the stop and the take
 profit fall inside one bar it assumes the stop filled first (conservative).
 Backtest one market file at a time: the loader refuses a dataset that mixes
 symbols, providers or intervals, which would silently corrupt every figure.
+
+### Choosing a timeframe
+
+The default is **`4h`**, not `15m`, because that is what real MFP candles show.
+Pulled from the public `candles.history` stream and run net of costs
+(risk-per-trade 0.5%, daily-loss 2%, total-drawdown 3%):
+
+| Market | TF | Strategy | Trades | Win% | Return | Max DD | MAR | PF | Folds+ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BTC | 15m | `ema_cross` | 37 | 32 | -3.3% | 5.6% | -3.14 | 0.77 | 20% |
+| BTC | 15m | `donchian_breakout` | 77 | 35 | -3.0% | 8.0% | -0.66 | 0.89 | 0% |
+| BTC | 4h | `donchian_breakout` | 133 | 40 | **+8.4%** | 4.1% | **0.73** | **1.19** | **100%** |
+| ETH | 4h | `donchian_breakout` | 142 | 39 | **+8.3%** | 4.3% | 0.68 | 1.17 | 67% |
+| BTC | 1d | `donchian_breakout` | 64 | 47 | **+10.6%** | 4.5% | 0.32 | **1.58** | 50% |
+
+BTC 4h and ETH 4h use 6 walk-forward folds (~2.7 years of data); the 15m and 1d
+figures use 5. Two things stand out:
+
+* **15m has no edge for any shipped strategy** - and it is *not* a cost problem:
+  BTC 15m donchian is -3.0% gross versus -3.1% net, so the signal is simply
+  noise at that resolution. Higher timeframes are where a trend system pays.
+* **`donchian_breakout` beats the `ema_cross` baseline** everywhere it is
+  positive (BTC 4h: PF 1.19 vs 1.08; BTC 1d: 1.58 vs 0.77). The EMA crossover
+  this strategy replaces is not competitive on this data.
+
+Prefer `4h` as the balance point: it keeps drawdown near the 3% guard and its
+edge holds out-of-sample. `1d` is also viable but has far fewer bars, so its
+folds are a small sample. Treat breakeven/trailing (`FP_BREAKEVEN_AT_R`,
+`FP_TRAIL_ATR_MULT`) as **off by default** and enable them per market only if a
+backtest shows they help - on this data they raised BTC 4h's win rate but
+lowered its return, while helping ETH 4h. Validate any switch with
+`--walk-forward` before trusting it.
 
 ## Two accounts: execution and copy trading
 
@@ -437,14 +469,14 @@ live) and let the bot-side guards be the protection. Recommended `.env`:
 FP_ENV=live
 FP_ACCOUNT_ID=FP-94193894          # the $100k account
 FP_STRATEGY=donchian_breakout      # the default
-FP_TIMEFRAME=15m
+FP_TIMEFRAME=4h                    # the default; where the edge is (see above)
 FP_DONCHIAN_PERIOD=20
 FP_REGIME_ADX_MIN=20
 FP_TREND_EMA=200
 FP_RISK_PER_PCT=0.5                # <= 1 keeps a bad day well under any limit
 FP_ATR_STOP_MULT=2.0
 FP_TP_RR=2.0
-FP_BREAKEVEN_AT_R=1.0            # scratch reversals near flat instead of -1R
+FP_BREAKEVEN_AT_R=0             # off; enable per market only if a backtest helps
 FP_BREAKEVEN_PLUS_R=0.1
 FP_TRAIL_ATR_MULT=0              # enable (e.g. 3.0) only after backtesting it
 FP_MAX_DAILY_LOSS_PCT=2.0          # bot-side daily stop (the firm gives none)
@@ -458,9 +490,10 @@ equity, so three bad trades in a day still fit inside the 2% daily cap; the 3%
 cumulative guard stops the bot before the account's own static 3% floor. If you
 ever copy this account to the $2.5K follower, `0.5%` per trade is ~`$12.5` on
 the lead, which keeps a normal losing day near the follower's `$75` daily room.
-**Validate the strategy before trusting it**: see *Backtesting and edge* above;
+**Validate the strategy before trusting it**: see *Choosing a timeframe* above;
 record real MFP candles with `python -m mfpbot archive` and require most
-walk-forward folds to be positive.
+walk-forward folds to be positive. Start with the `4h` default; do not move to
+`15m` without re-running the backtest.
 
 ### Loading the API key
 
