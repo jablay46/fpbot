@@ -99,8 +99,19 @@ class RiskManager:
             state.entries_today = 0
             state.halted = False
             state.halt_reason = ""
+            log.warning(
+                "new UTC day %s: daily loss baseline set to current equity %s "
+                "(first candle of the day, not 00:00 UTC), so the daily figure is "
+                "approximate",
+                today, equity,
+            )
         elif state.day_start_equity is None:
             state.day_start_equity = equity
+            log.warning(
+                "no stored equity baseline for %s; using current equity %s, so the "
+                "daily loss figure may be inaccurate",
+                today, equity,
+            )
         return state
 
     def check_kill(self, state: RiskState, equity: float, account_risk: dict) -> Decision:

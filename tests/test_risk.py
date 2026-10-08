@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from mfpbot.risk.manager import RiskManager, RiskState
@@ -116,6 +117,24 @@ def test_roll_day_resets_counters():
     assert state.day == "2026-01-02"
     assert state.entries_today == 0
     assert state.halted is False
+
+
+def test_roll_day_warns_when_baseline_is_estimated(caplog):
+    """A baseline taken mid-day (no stored state) is flagged as approximate."""
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=None)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        mgr.roll_day(state, equity=100000, now=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc))
+    assert state.day_start_equity == 100000
+    assert any("baseline" in r.message.lower() for r in caplog.records)
+
+
+def test_roll_day_does_not_warn_when_baseline_is_known(caplog):
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        mgr.roll_day(state, equity=100100, now=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc))
+    assert not any("baseline" in r.message.lower() for r in caplog.records)
 
 
 def test_allows_when_everything_is_healthy():
