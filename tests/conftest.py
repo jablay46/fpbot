@@ -98,6 +98,8 @@ class StubState:
     orders: list[dict[str, Any]] = field(default_factory=list)
     positions: list[dict[str, Any]] = field(default_factory=list)
     risk: dict[str, Any] = field(default_factory=lambda: risk_snapshot())
+    # Mid price served per market; tests mutate this to move the quote.
+    quotes: dict[str, float] = field(default_factory=lambda: dict(QUOTES))
     order_status: str = "filled"
     account_status: str = "active"
     # When true, drop every POST /v1/orders response after recording the order,
@@ -192,7 +194,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"data": MARKETS})
         elif path.startswith("/v1/markets/") and path.endswith("/quote"):
             market_id = self._market_id_from_path(path[: -len("/quote")])
-            mid = QUOTES.get(market_id)
+            mid = self.state.quotes.get(market_id)
             if mid is None:
                 self._send(404, {"error": {"code": "not_found", "message": "no market"}})
                 return

@@ -369,6 +369,41 @@ def test_run_offloads_candle_work_to_a_worker_thread(stub_server, tmp_path, monk
     assert len(state.orders) == 1  # the trade still happened
 
 
+def test_entry_allowed_within_atr_drift(stub_server, tmp_path):
+    """A small move off the candle close is fine when ATR gives room."""
+    bot, state = build_bot(stub_server, tmp_path)
+    # candle close 100, ATR 2 -> allowed drift 0.5 * 2 = 1.0 (1%).
+    state.quotes["binance|BTCUSDT"] = 100.6
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, 100.0))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_entry_blocked_beyond_atr_drift_even_under_absolute_cap(stub_server, tmp_path):
+    """Drift wider than the ATR budget is skipped well below the 5% hard cap."""
+    # ATR ~9.9 here, so a 0.05 budget is ~0.49: far tighter than the 5% ceiling.
+    bot, state = build_bot(stub_server, tmp_path, max_entry_drift_atr=0.05)
+    state.quotes["binance|BTCUSDT"] = 101.0  # 1.0 off close, over the ATR budget
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, 100.0))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_entry_blocked_beyond_absolute_drift_cap(stub_server, tmp_path):
+    """The 5% absolute cap still applies when ATR would allow more."""
+    bot, state = build_bot(stub_server, tmp_path, max_entry_drift_atr=10.0)
+    state.quotes["binance|BTCUSDT"] = 110.0  # 10% > 5% hard cap
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, 100.0))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
 def test_dry_run_uses_a_separate_state_file(stub_server, tmp_path):
     """A dry run must neither read nor write the live state file."""
     base_url, stub = stub_server

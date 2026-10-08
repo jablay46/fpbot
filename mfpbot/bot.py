@@ -513,17 +513,23 @@ class Bot:
         if signal.stop_price is None:
             log.warning("%s: signal has no stop price; skipping entry", market_id)
             return
-        if abs(entry - candle.close) / candle.close > MAX_ENTRY_DRIFT:
-            log.warning(
-                "%s: quote %s is more than %.0f%% away from candle close %s; skipping entry",
-                market_id, fmt(entry), MAX_ENTRY_DRIFT * 100, fmt(candle.close),
-            )
-            return
 
         # Re-anchor the ATR stop distance to the actual entry price.
         distance = abs(candle.close - signal.stop_price)
         if distance <= 0:
             log.warning("%s: signal has no usable stop distance; skipping entry", market_id)
+            return
+
+        # The quote must not have drifted far from the close that produced the
+        # signal: cap by a fraction of ATR, and by an absolute ceiling.
+        atr = distance / self.cfg.atr_stop_mult if self.cfg.atr_stop_mult else 0.0
+        allowed_drift = min(MAX_ENTRY_DRIFT * candle.close, self.cfg.max_entry_drift_atr * atr)
+        if abs(entry - candle.close) > allowed_drift:
+            log.warning(
+                "%s: quote %s drifted %s from candle close %s (allowed %s); skipping entry",
+                market_id, fmt(entry), fmt(abs(entry - candle.close)),
+                fmt(candle.close), fmt(allowed_drift),
+            )
             return
         if signal.action == "long":
             stop = entry - distance

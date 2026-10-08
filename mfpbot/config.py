@@ -51,6 +51,9 @@ class Config:
     min_daily_room_pct: float = 0.5
     # Cap total position margin as a percent of equity across all markets.
     max_margin_pct: float = 50.0
+    # Allowed quote-vs-candle-close drift, as a multiple of ATR (bounded by the
+    # absolute cap in bot.py).
+    max_entry_drift_atr: float = 0.5
     # "bot" closes only positions this bot opened; "account" closes everything.
     flatten_scope: str = "bot"
     # "halt" or "bot-only"; empty means choose by environment (live -> halt).
@@ -147,6 +150,8 @@ class Config:
             raise ConfigError("FP_ON_MISSING_ROOM must be 'halt' or 'bot-only'.")
         if not 0 < self.max_margin_pct <= 100:
             raise ConfigError("FP_MAX_MARGIN_PCT must be between 0 and 100.")
+        if self.max_entry_drift_atr <= 0:
+            raise ConfigError("FP_MAX_ENTRY_DRIFT_ATR must be greater than zero.")
         if self.poll_seconds <= 0:
             raise ConfigError("FP_POLL_SECONDS must be greater than zero.")
 
@@ -172,6 +177,7 @@ _ENV_KEYS = {
     "max_daily_trades": "FP_MAX_DAILY_TRADES",
     "min_daily_room_pct": "FP_MIN_DAILY_ROOM_PCT",
     "max_margin_pct": "FP_MAX_MARGIN_PCT",
+    "max_entry_drift_atr": "FP_MAX_ENTRY_DRIFT_ATR",
     "flatten_scope": "FP_FLATTEN_SCOPE",
     "on_missing_room": "FP_ON_MISSING_ROOM",
     "poll_seconds": "FP_POLL_SECONDS",
@@ -188,6 +194,7 @@ _FLOAT_FIELDS = {
     "max_daily_loss_pct",
     "min_daily_room_pct",
     "max_margin_pct",
+    "max_entry_drift_atr",
     "poll_seconds",
 }
 _INT_FIELDS = {"ema_fast", "ema_slow", "atr_period", "max_daily_trades"}
