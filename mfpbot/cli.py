@@ -8,11 +8,13 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any
 
 from .bot import Bot
 from .client import ApiError, MfpClient
 from .config import ConfigError, load_config, load_dotenv_file
+from .state import load_state, save_state
 from .util import fmt
 
 
@@ -109,6 +111,41 @@ def cmd_positions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reset_halt(args: argparse.Namespace) -> int:
+    """Clear the persistent halts on the configured state file.
+
+    A cumulative-drawdown halt (and a daily halt) is intentionally sticky, so
+    resuming requires an explicit, acknowledged operator action.
+    """
+    cfg = load_config(require_key=False)
+    path = cfg.state_path
+    if not args.yes:
+        print(
+            f"refusing to reset halts in {path!r} without --yes.\n"
+            "This clears the cumulative-drawdown halt and the daily halt so the bot "
+            "resumes trading on this account. Re-run as:\n"
+            "  python -m mfpbot reset-halt --yes",
+            file=sys.stderr,
+        )
+        return 2
+    if os.path.exists(path):
+        age = time.time() - os.path.getmtime(path)
+        if age < 60:
+            print(
+                f"warning: {path!r} was modified {age:.0f}s ago; the bot may be "
+                "running. Stop it first, or this reset may be overwritten.",
+                file=sys.stderr,
+            )
+    state = load_state(path)
+    state.risk.halted = False
+    state.risk.halt_reason = ""
+    state.risk.total_drawdown_halted = False
+    state.risk.total_drawdown_reason = ""
+    save_state(path, state)
+    print(f"cleared halts in {path}; the bot will trade again on restart")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mfpbot", description="MyFundedPerps trading bot")
     parser.add_argument("--config-file", help="Optional JSON/YAML config file")
@@ -130,6 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pos = sub.add_parser("positions", help="List open positions")
     p_pos.set_defaults(func=cmd_positions)
+
+    p_reset = sub.add_parser("reset-halt", help="Clear a persistent halt in the state file")
+    p_reset.add_argument("--yes", action="store_true", help="Confirm the halt reset")
+    p_reset.set_defaults(func=cmd_reset_halt)
 
     return parser
 

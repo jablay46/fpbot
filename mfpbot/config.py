@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("mfpbot.config")
 
 ENVIRONMENTS = {
     "live": "https://developers.myfundedperpetuals.com",
@@ -49,6 +52,14 @@ class Config:
     max_daily_loss_pct: float = 2.0
     max_daily_trades: int = 6
     min_daily_room_pct: float = 0.5
+    # Bot-side cumulative drawdown guard, independent of the API's room figures
+    # (which are null on a live challenge account). 0 = disabled.
+    max_total_drawdown_pct: float = 0.0
+    # "starting" measures drawdown from the account starting balance (static);
+    # "peak" measures it from the highest equity ever observed (trailing).
+    drawdown_basis: str = "starting"
+    # Explicit acknowledgement to run live+bot-only with no cumulative guard.
+    ack_no_drawdown_guard: bool = False
     # Cap total position margin as a percent of equity across all markets.
     max_margin_pct: float = 50.0
     # Allowed quote-vs-candle-close drift, as a multiple of ATR (bounded by the
@@ -148,6 +159,32 @@ class Config:
             raise ConfigError("FP_FLATTEN_SCOPE must be 'bot' or 'account'.")
         if self.on_missing_room and self.on_missing_room not in {"halt", "bot-only"}:
             raise ConfigError("FP_ON_MISSING_ROOM must be 'halt' or 'bot-only'.")
+        if not 0.0 <= self.max_total_drawdown_pct < 100.0:
+            raise ConfigError("FP_MAX_TOTAL_DRAWDOWN_PCT must be >= 0 and < 100.")
+        if self.drawdown_basis not in {"starting", "peak"}:
+            raise ConfigError("FP_DRAWDOWN_BASIS must be 'starting' or 'peak'.")
+        # Fail closed on the one configuration that removes every cumulative
+        # drawdown guard: a live, non-dry-run bot-only run with no bot-side cap.
+        # The API reports null room figures on challenge accounts, so nothing
+        # else bounds a losing streak. A dry run never sends orders and a
+        # sandbox account is not real money, so those only warn.
+        if (
+            self.missing_room_policy == "bot-only"
+            and self.max_total_drawdown_pct == 0.0
+            and not self.ack_no_drawdown_guard
+        ):
+            if self.environment == "live" and not self.dry_run:
+                raise ConfigError(
+                    "Live account with FP_ON_MISSING_ROOM=bot-only has no cumulative "
+                    "drawdown guard: the API reports null room figures, so the bot-side "
+                    "daily cap resets every UTC day. Set FP_MAX_TOTAL_DRAWDOWN_PCT to a "
+                    "positive percent (e.g. 10), or set FP_ACK_NO_DRAWDOWN_GUARD=true to "
+                    "accept the risk explicitly."
+                )
+            log.warning(
+                "FP_ON_MISSING_ROOM=bot-only without FP_MAX_TOTAL_DRAWDOWN_PCT: no "
+                "cumulative drawdown guard; only the per-day bot caps apply"
+            )
         if not 0 < self.max_margin_pct <= 100:
             raise ConfigError("FP_MAX_MARGIN_PCT must be between 0 and 100.")
         if self.max_entry_drift_atr <= 0:
@@ -176,6 +213,9 @@ _ENV_KEYS = {
     "max_daily_loss_pct": "FP_MAX_DAILY_LOSS_PCT",
     "max_daily_trades": "FP_MAX_DAILY_TRADES",
     "min_daily_room_pct": "FP_MIN_DAILY_ROOM_PCT",
+    "max_total_drawdown_pct": "FP_MAX_TOTAL_DRAWDOWN_PCT",
+    "drawdown_basis": "FP_DRAWDOWN_BASIS",
+    "ack_no_drawdown_guard": "FP_ACK_NO_DRAWDOWN_GUARD",
     "max_margin_pct": "FP_MAX_MARGIN_PCT",
     "max_entry_drift_atr": "FP_MAX_ENTRY_DRIFT_ATR",
     "flatten_scope": "FP_FLATTEN_SCOPE",
@@ -193,12 +233,13 @@ _FLOAT_FIELDS = {
     "leverage",
     "max_daily_loss_pct",
     "min_daily_room_pct",
+    "max_total_drawdown_pct",
     "max_margin_pct",
     "max_entry_drift_atr",
     "poll_seconds",
 }
 _INT_FIELDS = {"ema_fast", "ema_slow", "atr_period", "max_daily_trades"}
-_BOOL_FIELDS = {"dry_run"}
+_BOOL_FIELDS = {"dry_run", "ack_no_drawdown_guard"}
 _LIST_FIELDS = {"symbols"}
 
 

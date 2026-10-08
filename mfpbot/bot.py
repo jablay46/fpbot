@@ -128,7 +128,27 @@ class Bot:
             min_daily_room_pct=self.cfg.min_daily_room_pct,
             starting_balance=starting,
             missing_room_policy=self.cfg.missing_room_policy,
+            max_total_drawdown_pct=self.cfg.max_total_drawdown_pct,
+            drawdown_basis=self.cfg.drawdown_basis,
         )
+
+    def _check_safety_config_or_raise(self) -> None:
+        """Refuse to start a live run that cannot enforce a cumulative guard.
+
+        The API reports null room figures on challenge accounts, so a bot-only
+        run with the ``starting`` basis needs the account starting balance to
+        measure drawdown. Without it (or with the guard disabled) a live run
+        would have no cumulative protection and must not start.
+        """
+        needs_start = (
+            self.cfg.max_total_drawdown_pct > 0 and self.cfg.drawdown_basis == "starting"
+        )
+        if needs_start and self.risk is not None and self.risk.starting_balance <= 0:
+            raise RuntimeError(
+                "FP_DRAWDOWN_BASIS=starting but the account starting balance is "
+                "unavailable or 0; cannot enforce FP_MAX_TOTAL_DRAWDOWN_PCT. Set "
+                "FP_DRAWDOWN_BASIS=peak or fix the account, then restart."
+            )
 
     # -- helpers ----------------------------------------------------------
 
@@ -740,12 +760,24 @@ class Bot:
         immediately, so no new entry can start afterwards. The caller is
         responsible for flattening (outside the lock).
         """
+        equity = self._equity(account_risk)
+        # Cumulative drawdown first: it outlives day rollover and never clears
+        # itself, so it must be evaluated before (and independent of) roll_day.
+        total = self.risk.check_total_drawdown(self.state.risk, equity)
+        if not total.allowed:
+            if not self.state.risk.total_drawdown_halted:
+                self.state.risk.total_drawdown_halted = True
+                self.state.risk.total_drawdown_reason = total.reason
+                log.error("total drawdown kill switch: %s", total.reason)
+            save_state(self.cfg.state_path, self.state)
+            return True, total.reason
+        if self.state.risk.total_drawdown_halted:
+            return True, self.state.risk.total_drawdown_reason
         if self.state.risk.halted:
             if self.state.risk.day == _utc_day(self._now()):
                 return True, None
             # The UTC day rolled over: roll_day below clears the halt so the new
             # day is guarded like any other.
-        equity = self._equity(account_risk)
         self.risk.roll_day(self.state.risk, equity, now=self._now())
         kill = self.risk.check_kill(self.state.risk, equity, account_risk)
         if kill.allowed:
@@ -767,7 +799,9 @@ class Bot:
         would silently leave the account unprotected on the following day.
         """
         with self._lock:
-            halted_today = self.state.risk.halted and self.state.risk.day == _utc_day(self._now())
+            halted_today = self.state.risk.total_drawdown_halted or (
+                self.state.risk.halted and self.state.risk.day == _utc_day(self._now())
+            )
             needs_flatten = bool(self.state.owned_position_ids)
         if halted_today:
             # Already halted today: no new entries are possible. Keep retrying
@@ -830,6 +864,7 @@ class Bot:
         self.resolve_account()
         self.resolve_markets()
         self.risk = self._build_risk_manager()
+        self._check_safety_config_or_raise()
         # A restart may leave an entry unconfirmed; resolve it before trading.
         self._reconcile_pending_entry()
 
