@@ -390,3 +390,55 @@ def make_candles(
             )
         )
     return candles
+
+
+def make_bars(
+    closes: list[float],
+    *,
+    start_time: int = 1_700_000_000_000,
+    interval_ms: int = 60_000,
+    wick: float = 1.0,
+    highs: list[float] | None = None,
+    lows: list[float] | None = None,
+) -> list:
+    """Build backtest ``Bar`` objects; wicks default to +/- ``wick``."""
+    from mfpbot.backtest import Bar
+
+    bars = []
+    for i, close in enumerate(closes):
+        open_time = start_time + i * interval_ms
+        hi = highs[i] if highs is not None else close + wick
+        lo = lows[i] if lows is not None else close - wick
+        bars.append(Bar(open_time=open_time, open=close, high=hi, low=lo, close=close, volume=1.0))
+    return bars
+
+
+def random_walk_bars(
+    n: int,
+    *,
+    start: float = 30_000.0,
+    vol: float = 0.002,
+    drift: float = 0.0,
+    seed: int = 7,
+    interval_ms: int = 900_000,
+    start_time: int = 1_700_000_000_000,
+) -> list:
+    """A seeded geometric random walk as backtest bars (reproducible)."""
+    import random
+
+    from mfpbot.backtest import Bar
+
+    rng = random.Random(seed)
+    bars = []
+    price = start
+    for i in range(n):
+        price *= (1.0 + drift + rng.gauss(0.0, vol))
+        open_time = start_time + i * interval_ms
+        wick = price * vol
+        bars.append(
+            Bar(
+                open_time=open_time, open=price * (1.0 - drift / 2),
+                high=price + wick, low=price - wick, close=price, volume=1.0,
+            )
+        )
+    return bars

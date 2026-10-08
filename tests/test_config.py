@@ -172,11 +172,30 @@ def test_live_bot_only_without_drawdown_guard_refuses_start():
         load_config(
             env={
                 "FP_API_KEY": "fp_live_abc", "FP_ENV": "live",
-                "FP_ON_MISSING_ROOM": "bot-only",
+                "FP_ON_MISSING_ROOM": "bot-only", "FP_MAX_TOTAL_DRAWDOWN_PCT": "0",
             },
             require_key=True,
         )
     assert "drawdown" in str(excinfo.value).lower()
+
+
+def test_recommended_defaults():
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc"}, require_key=True)
+    assert cfg.strategy == "donchian_breakout"
+    assert cfg.regime_adx_min == 20.0
+    assert cfg.trend_ema == 200
+    # The default cumulative guard matches the firm's static 3% Select floor.
+    assert cfg.max_total_drawdown_pct == 3.0
+
+
+def test_live_bot_only_is_allowed_by_the_default_drawdown_guard():
+    # The recommended default (3%) means a live bot-only run no longer needs an
+    # explicit acknowledgement to start.
+    cfg = load_config(
+        env={"FP_API_KEY": "fp_live_abc", "FP_ENV": "live", "FP_ON_MISSING_ROOM": "bot-only"},
+        require_key=True,
+    )
+    assert cfg.max_total_drawdown_pct == 3.0
 
 
 def test_live_bot_only_with_drawdown_guard_accepted():

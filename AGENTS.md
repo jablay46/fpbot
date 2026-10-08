@@ -72,6 +72,45 @@ risk budget, and places orders with broker-side TP/SL.
   `isFinal: true` for completed history bars and `isFinal: false` for the
   forming bar (repeated on each update). `Candle.from_event` reads `isFinal`,
   and `_process_candle` ignores non-final bars.
+* **Historical candles:** REST has no klines endpoint. The WebSocket exposes a
+  one-shot `{"op":"req","id":N,"method":"candles.history","payload":
+  {"provider","symbol","interval","limit",...,"startTime","endTime","priceKind"}}`
+  whose `result` is an array of candle events. Retention/availability is
+  provider-bounded (short or empty results happen). Implemented as
+  `MarketDataStream.fetch_history`. `limit 0` skips retained replay.
+  Accepted intervals: `1s 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w 1M`.
+* **Fees (published, used by the backtester's cost model):** crypto commission
+  **0.03%** per fill (maker = taker); crypto hourly swap **0.03%/day** divided
+  into 24 hourly charges (both sides pay). Crypto adverse slippage is banded by
+  open interest (e.g. $100M–$500M OI, up to $100k notional: 1.2 bps/side); a
+  size-aware `GET /v1/markets/{id}/quote` returns the projected `slippage_bps`.
+* **Challenge rules (1-Step Select):** profit target **9%**, daily loss limit
+  **3%**, **static** max drawdown **3%** — all percentages of the *starting
+  balance*, never current equity; rules use account equity incl. open P&L. The
+  daily limit resets at midnight `America/New_York` (not a fixed UTC time). The
+  $2.5K Select prize account has a $2,425 floor and a $225 target. These numbers
+  come from `GET /v1/accounts/{id}/trading-policy` at runtime; prefer the API's
+  `account_rules` over hard-coding.
+* **Copy trading:** native, same-owner, one lead + followers, multiplier
+  0.1x–2x, follower size normalized by starting balance. Configured in the
+  website UI (not via this bot's API). A follower is **locked against manual
+  trading** while enabled, and each follower order is re-validated against its
+  own rules/balance (it can reject or shrink). `GET
+  /v1/accounts/{id}/trading-policy` exposes `copy_follower_locked` and
+  `copy_stop`. See `docs.myfundedperpetuals.com/guides/copy-trading-guide`.
+* **Trading-policy fields to consume at runtime:** `account_rules` (effective
+  daily-loss / drawdown / target), `limits` (`max_open_positions`,
+  `max_position_value_usd`, `min_order_notional_usd`, `trades_per_minute`,
+  `order_cooldown_ms`), `maximum_total_notional_usd`, `opening_exposure_restricted`,
+  `trading_halt`, `competition` (window + symbol allowlist),
+  `copy_follower_locked`, `copy_scope_blocked`, `manual_trading_blocked`,
+  `fee_exempt`. The snapshot is advisory; placement is authoritative.
+* **October Competition fair play:** forbids operating more than one account
+  *for the competition*, trading someone else's, or **copying/mirroring/
+  coordinating trades across (different users') accounts**, and exploiting stale
+  prices/latency. Same-owner copy trading on normal challenge accounts is a
+  platform feature, but do not run this bot on a competition account in a way
+  the competition rules forbid.
 
 ## Conventions
 
@@ -80,7 +119,18 @@ risk budget, and places orders with broker-side TP/SL.
 * Sizes must be exact multiples of the market `size_step`; use
   `mfpbot.util.round_step` (Decimal-based) rather than float math.
 * Strategies emit a signal only on the crossing candle and only from **closed**
-  candles. Keep the strategy interface in `mfpbot/strategy/base.py`.
+  candles. Keep the strategy interface in `mfpbot/strategy/base.py`. Strategies
+  share the `Signal` contract (`action`, `stop_price`, `take_profit_price`), so
+  a new strategy needs no change to the bot or the backtester. Give strategy
+  `__init__` params unique names (`donchian_period`, `supertrend_mult`, …):
+  `build_strategy` filters kwargs by each signature, so a shared name would
+  leak between strategies.
+* **Backtesting:** `mfpbot/backtest/` holds the dataset loader, the cost model
+  (crypto 0.03%/fill, 0.03%/day swap, banded slippage), the bar engine with the
+  same guards as the live bot, the metrics, and walk-forward. `mfpbot/archiver.py`
+  records live candles to JSONL (the REST API has no history endpoint). The
+  engine assumes the **stop fills first** when a bar spans both stop and target.
+  Never report gross numbers as edge; the default is net of cost.
 * Risk guards live in `mfpbot/risk/`. Two layers: bot-side daily caps and
   account-side room from the API risk snapshot. `RiskState` also lives in
   `mfpbot/state.py` alongside the persisted `BotState`.

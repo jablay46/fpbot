@@ -71,6 +71,11 @@ class Bot:
             atr_period=config.atr_period,
             atr_stop_mult=config.atr_stop_mult,
             take_profit_rr=config.take_profit_rr,
+            donchian_period=config.donchian_period,
+            regime_adx_min=config.regime_adx_min,
+            trend_ema=config.trend_ema,
+            supertrend_period=config.supertrend_period,
+            supertrend_mult=config.supertrend_mult,
         )
         self.account: Optional[dict[str, Any]] = None
         self.risk: Optional[RiskManager] = None

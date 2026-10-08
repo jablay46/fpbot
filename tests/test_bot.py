@@ -59,6 +59,9 @@ def build_bot(stub_server, tmp_path, symbols=None, state=None, clock=None, **ove
         max_daily_trades=6,
         max_daily_loss_pct=2.0,
         min_daily_room_pct=0.5,
+        # Daily-halt tests want the bot-side daily cap to be the deciding guard,
+        # so the cumulative one (default 3%) is off here.
+        max_total_drawdown_pct=0.0,
         state_file=str(tmp_path / "state.json"),
         dry_run=False,
     )

@@ -117,19 +117,100 @@ How it works:
 
 ## Strategy
 
-The default `ema_cross` strategy:
+Three strategies share one interface (`mfpbot/strategy/`), selected with
+`FP_STRATEGY`:
 
-1. Builds EMA(fast) and EMA(slow) plus Wilder ATR from **closed** candles.
-2. Fires a **long** signal when EMA(fast) crosses above EMA(slow), and a
-   **short** signal when it crosses below. Signals fire only on the crossing
-   candle, so the bot acts once per cross.
-3. Places a market order with an attached take profit (`entry + rr * stop
-   distance`) and stop loss (`entry - atr_stop_mult * ATR`), sized so the loss
-   to the stop equals `FP_RISK_PER_PCT` of equity.
+* `ema_cross` (default) — long/short when EMA(fast) crosses EMA(slow). Fires
+  only on the crossing candle.
+* `donchian_breakout` — enters when a closed candle closes beyond the previous
+  `FP_DONCHIAN_PERIOD`-bar high/low, with an optional ADX regime floor
+  (`FP_REGIME_ADX_MIN`) and EMA trend filter (`FP_TREND_EMA`). Fewer, less
+  whipsaw-prone entries than an EMA cross.
+* `supertrend` — an ATR trailing band; signals on the flip. Calmest of the
+  three in a range.
 
-If a signal reverses an existing position, the bot closes the position and
-opens the new one. The stop and take profit live on the broker side, so they
-trigger even if the bot is offline.
+All three size the stop from `FP_ATR_STOP_MULT * ATR` (Supertrend uses its own
+band line) and set the take profit at `FP_TP_RR` times the stop distance, so
+position sizing and the broker-side exits work identically. The stop and take
+profit live on the broker side, so they trigger even if the bot is offline.
+
+An ATR-based stop plus a fixed reward:risk means the risk per trade is a
+constant fraction of equity regardless of volatility. Combined with a trend
+filter, that is what keeps the account drawdown guard (below) from ever firing.
+
+**Which strategy is better is an empirical question — measure it, do not guess.**
+See the next section.
+
+## Backtesting and edge
+
+The REST API has no historical-candle endpoint, but the public WebSocket does
+expose a `candles.history` request (`MarketDataStream.fetch_history`). Two ways
+to get a dataset:
+
+```bash
+# A) Record live candles from the stream to a JSONL archive (run alongside the
+#    bot, or on its own). Resumable and de-duplicated by bar open time.
+python -m mfpbot archive --symbols binance|BTCUSDT --timeframe 15m --out data/btc15m.jsonl
+
+# B) Or use any OHLCV CSV/JSONL you already have (e.g. an exchange export).
+```
+
+Then compare every strategy over the same bars, net of the firm's published
+costs, and validate out-of-sample:
+
+```bash
+python -m mfpbot backtest --bars data/btc15m.jsonl \
+  --equity 100000 --risk-pct 0.5 \
+  --max-daily-loss-pct 3 --max-total-drawdown-pct 3 \
+  --walk-forward 5
+```
+
+The reported metrics are all **after** costs:
+commission (crypto 0.03%/fill), hourly swap (crypto 0.03%/day) and adverse
+slippage (default 1.2 bps/side), matching
+`docs.myfundedperpetuals.com/guides/commissions-and-fees` and
+`/guides/trading-guide`. `--no-costs` shows the gross picture for contrast.
+
+Read the output this way:
+
+* `MAR` (CAGR / max drawdown) is the headline for a prop account — you are
+  judged on drawdown, not on headline return.
+* `profitable_folds` from `--walk-forward` is the reality check. A strategy that
+  only wins in-sample is overfit; require most folds to be positive.
+* Compare against `ema_cross` as the baseline that a replacement must beat.
+
+The engine (`mfpbot/backtest/engine.py`) applies the same daily-loss,
+cumulative-drawdown and daily-trade guards as the live bot, so a strategy is
+measured under the constraints it will actually trade under. When both the stop
+and the take profit fall inside one bar it assumes the stop filled first
+(conservative).
+
+## Two accounts: execution and copy trading
+
+MyFundedPerps has **native copy trading** within one owner's accounts
+(`docs.myfundedperpetuals.com/guides/copy-trading-guide`). Configure it in the
+website UI: one **lead** and one or more **followers**, each with a multiplier
+(0.1x–2x). Follower size is normalized by starting balance, so a $2.5K follower
+takes the $100K lead's position at ~1/40th size automatically.
+
+```bash
+# Run the bot only on the lead; configure the follower via Settings → Copy Trading.
+FP_ACCOUNT_ID=FP-94193894 FP_STRATEGY=donchian_breakout python -m mfpbot run
+```
+
+Two cautions, straight from the docs:
+
+* A follower account is **locked against manual trading** while its group is
+  enabled. Do not point the bot at both accounts.
+* Every follower order is re-validated against **its own** rules and balance, so
+  it can reject or shrink a copy. The $2.5K account's 3% daily allowance is only
+  $75 — the lead's risk per trade must be sized so that a normal losing day does
+  not breach the follower's 3% daily limit before it breaches the lead's.
+  Keeping **risk per trade at or below ~1%** and **total exposure well under the
+  daily cap** is what keeps the follower inside its own rules.
+* Copying the same owner's accounts is expected. The **October Competition**
+  separately forbids mirroring *across different users* and disqualifies it; do
+  not point this bot at a competition account that the rules do not permit.
 
 ## Risk controls
 
@@ -144,15 +225,17 @@ trigger even if the bot is offline.
   starting balance, the bot flattens positions and halts. If the snapshot has
   no room figures at all, the bot fails closed (`FP_ON_MISSING_ROOM=halt`) unless
   it is explicitly allowed to keep going on bot-side caps (`bot-only`).
-* **Cumulative drawdown guard** — the competition account reports null room
+* **Cumulative drawdown guard** — the live challenge account reports null room
   figures, so with `FP_ON_MISSING_ROOM=bot-only` nothing beyond the daily cap
   (which resets every UTC day) would stop a multi-day slide. Set
   `FP_MAX_TOTAL_DRAWDOWN_PCT` to cap the whole-account drawdown from
   `FP_DRAWDOWN_BASIS` (`starting`, the default, or the trailing `peak`). It
   warns at 50% and 80% of the limit and, once breached, sets a sticky halt that
   survives day rollover and restarts until released with
-  `python -m mfpbot reset-halt --yes`. A live `bot-only` run with no guard must
-  be acknowledged with `FP_ACK_NO_DRAWDOWN_GUARD=true` or it refuses to start.
+  `python -m mfpbot reset-halt --yes`. The default is **3**, matching the
+  firm's static 3% Select floor. A live `bot-only` run with no guard
+  (`FP_MAX_TOTAL_DRAWDOWN_PCT=0`) must be acknowledged with
+  `FP_ACK_NO_DRAWDOWN_GUARD=true` or it refuses to start.
 * **Kill switch runs even while holding a position** — a watchdog polls the
   account between candles, so the daily loss cap and room floor fire without
   waiting for the next signal. It keeps running for the life of the bot (the
@@ -209,9 +292,11 @@ plus unit tests for indicators, strategy, sizing, risk, config and state.
 mfpbot/
   cli.py            command-line interface
   client.py         REST client (auth, retries, idempotency)
-  market_stream.py  public WebSocket candle/price stream
+  market_stream.py  public WebSocket candle/price stream (+ candles.history)
+  archiver.py       record closed candles to a JSONL dataset
   bot.py            orchestration: reconcile, signal, size, order
-  strategy/         indicators + EMA-cross strategy
+  strategy/         indicators + ema_cross / donchian_breakout / supertrend
+  backtest/         data loader, cost model, engine, metrics, walk-forward
   risk/             sizing + daily/account guards
   state.py          persisted state
 ```
@@ -231,6 +316,39 @@ The bot can trade a live challenge account, but go in this order:
 Sizing uses the account risk snapshot, so a live challenge account's daily-loss
 and max-drawdown floors are respected. The bot still cannot guarantee profit;
 challenge rules can fail the account on a bad day.
+
+### Recommended setup (the $100k evaluation account)
+
+A live evaluation account reports **null** `daily_loss_room` / `max_drawdown_room`
+and rule percentages of `0`, so the firm's API hands the bot **no daily risk
+limit** to enforce. Run it `bot-only` (default on sandbox; set explicitly on
+live) and let the bot-side guards be the protection. Recommended `.env`:
+
+```bash
+FP_ENV=live
+FP_ACCOUNT_ID=FP-94193894          # the $100k account
+FP_STRATEGY=donchian_breakout      # the default
+FP_TIMEFRAME=15m
+FP_DONCHIAN_PERIOD=20
+FP_REGIME_ADX_MIN=20
+FP_TREND_EMA=200
+FP_RISK_PER_PCT=0.5                # <= 1 keeps a bad day well under any limit
+FP_ATR_STOP_MULT=2.0
+FP_TP_RR=2.0
+FP_MAX_DAILY_LOSS_PCT=2.0          # bot-side daily stop (the firm gives none)
+FP_MAX_DAILY_TRADES=6
+FP_MAX_TOTAL_DRAWDOWN_PCT=3        # bot-side, matches the firm's 3% floor
+FP_ON_MISSING_ROOM=bot-only
+```
+
+Why these numbers: with `FP_RISK_PER_PCT=0.5` a losing trade costs ~0.5% of
+equity, so three bad trades in a day still fit inside the 2% daily cap; the 3%
+cumulative guard stops the bot before the account's own static 3% floor. If you
+ever copy this account to the $2.5K follower, `0.5%` per trade is ~`$12.5` on
+the lead, which keeps a normal losing day near the follower's `$75` daily room.
+**Validate the strategy before trusting it**: see *Backtesting and edge* above;
+record real MFP candles with `python -m mfpbot archive` and require most
+walk-forward folds to be positive.
 
 ### Loading the API key
 

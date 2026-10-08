@@ -152,6 +152,100 @@ def cmd_reset_halt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Backtest one strategy (or compare several) over local candle files."""
+    from .backtest import BacktestConfig, CostModel, Backtester, load_many, walk_forward
+    from .strategy import STRATEGIES, build_strategy
+
+    cfg = load_config(require_key=False)
+    bars = load_many(args.bars)
+    if not bars:
+        print("no bars loaded", file=sys.stderr)
+        return 2
+
+    costs = CostModel(
+        commission_pct=args.commission_pct,
+        swap_daily_pct=args.swap_daily_pct,
+        slippage_bps=args.slippage_bps,
+        apply_costs=not args.no_costs,
+    )
+    bt_config = BacktestConfig(
+        starting_equity=args.equity,
+        risk_per_trade_pct=args.risk_pct,
+        leverage=args.leverage,
+        max_margin_pct=cfg.max_margin_pct,
+        max_daily_loss_pct=args.max_daily_loss_pct,
+        max_total_drawdown_pct=args.max_total_drawdown_pct,
+        drawdown_basis=args.drawdown_basis,
+        max_daily_trades=args.max_daily_trades,
+        costs=costs,
+    )
+
+    overrides = {
+        "fast": cfg.ema_fast, "slow": cfg.ema_slow, "atr_period": cfg.atr_period,
+        "atr_stop_mult": cfg.atr_stop_mult, "take_profit_rr": cfg.take_profit_rr,
+        "donchian_period": cfg.donchian_period, "regime_adx_min": cfg.regime_adx_min,
+        "trend_ema": cfg.trend_ema, "supertrend_period": cfg.supertrend_period,
+        "supertrend_mult": cfg.supertrend_mult,
+    }
+
+    names = args.strategy or list(STRATEGIES)
+    for unknown in [n for n in names if n not in STRATEGIES]:
+        print(f"unknown strategy {unknown!r}; available: {sorted(STRATEGIES)}", file=sys.stderr)
+        return 2
+
+    print(f"{len(bars)} bar(s), {bars[0].open_time}..{bars[-1].open_time}, "
+          f"costs={'on' if not args.no_costs else 'off'}\n")
+    header = f"{'strategy':<20}{'trades':>7}{'win%':>7}{'ret%':>9}{'maxDD%':>8}{'MAR':>7}{'PF':>7}{'exp$':>9}"
+    print(header)
+    print("-" * len(header))
+    for name in names:
+        factory = lambda n=name: build_strategy(n, **overrides)
+        result = Backtester(factory(), bt_config, market={"market_id": args.market_id}).run(bars)
+        m = result.metrics
+        print(f"{name:<20}{m.trades:>7}{m.win_rate:>7.1f}{m.total_return_pct:>9.2f}"
+              f"{m.max_drawdown_pct:>8.2f}{m.mar:>7.2f}{m.profit_factor:>7.2f}{m.expectancy:>9.2f}")
+
+    if args.walk_forward > 1:
+        print(f"\nwalk-forward ({args.walk_forward} folds), per strategy:")
+        for name in names:
+            factory = lambda n=name: build_strategy(n, **overrides)
+            wf = walk_forward(factory, bars, bt_config, folds=args.walk_forward,
+                              market={"market_id": args.market_id})
+            print(f"  {name:<20} profitable_folds={wf.profitable_fraction:.0%} "
+                  f"median_ret={wf.median_return_pct:+.2f}% worstDD={wf.worst_drawdown_pct:.2f}%")
+            for fold in wf.folds:
+                fm = fold.result.metrics
+                print(f"      fold {fold.index}: ret={fm.total_return_pct:+.2f}% "
+                      f"dd={fm.max_drawdown_pct:.2f}% trades={fm.trades}")
+    return 0
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    """Record closed candles from the public market stream to a JSONL file."""
+    from .archiver import run_archive
+    from .market_stream import MarketDataStream
+
+    cfg = load_config(require_key=False)
+    markets = [_parse_market_id(s) for s in args.symbols]
+    stream = MarketDataStream.for_markets(
+        cfg.market_stream_url, markets, interval=args.timeframe, history_limit=args.history_limit
+    )
+    try:
+        written = asyncio.run(run_archive(stream, args.out, max_candles=args.max_candles))
+    except KeyboardInterrupt:
+        written = 0
+    print(f"archived {written} new bar(s) to {args.out}")
+    return 0
+
+
+def _parse_market_id(value: str) -> dict:
+    if "|" not in value:
+        raise ConfigError(f"market {value!r} must look like 'provider|COIN'")
+    provider, coin = value.split("|", 1)
+    return {"market_id": value, "provider": provider, "coin": coin}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mfpbot", description="MyFundedPerps trading bot")
     parser.add_argument("--config-file", help="Optional JSON/YAML config file")
@@ -177,6 +271,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_reset = sub.add_parser("reset-halt", help="Clear a persistent halt in the state file")
     p_reset.add_argument("--yes", action="store_true", help="Confirm the halt reset")
     p_reset.set_defaults(func=cmd_reset_halt)
+
+    p_bt = sub.add_parser("backtest", help="Backtest strategies over local candle files")
+    p_bt.add_argument("--bars", nargs="+", required=True, help="JSONL/CSV candle files")
+    p_bt.add_argument("--strategy", nargs="+", help="Strategy name(s); default: all")
+    p_bt.add_argument("--market-id", default="binance|BTCUSDT", help="Market id used for metadata")
+    p_bt.add_argument("--equity", type=float, default=100_000.0)
+    p_bt.add_argument("--risk-pct", type=float, default=1.0, help="Risk per trade, percent of equity")
+    p_bt.add_argument("--leverage", type=float, default=2.0)
+    p_bt.add_argument("--max-daily-loss-pct", type=float, default=0.0)
+    p_bt.add_argument("--max-total-drawdown-pct", type=float, default=0.0)
+    p_bt.add_argument("--drawdown-basis", default="starting", choices=["starting", "peak"])
+    p_bt.add_argument("--max-daily-trades", type=int, default=0)
+    p_bt.add_argument("--commission-pct", type=float, default=0.03)
+    p_bt.add_argument("--swap-daily-pct", type=float, default=0.03)
+    p_bt.add_argument("--slippage-bps", type=float, default=1.2)
+    p_bt.add_argument("--no-costs", action="store_true", help="Ignore fees/slippage/swap (gross)")
+    p_bt.add_argument("--walk-forward", type=int, default=0, help="Number of folds (>1 to enable)")
+    p_bt.set_defaults(func=cmd_backtest)
+
+    p_ar = sub.add_parser("archive", help="Record live candles to a JSONL file")
+    p_ar.add_argument("--symbols", nargs="+", required=True, help="market ids like binance|BTCUSDT")
+    p_ar.add_argument("--timeframe", default="15m")
+    p_ar.add_argument("--history-limit", type=int, default=300)
+    p_ar.add_argument("--out", required=True, help="Output JSONL file")
+    p_ar.add_argument("--max-candles", type=int, help="Stop after this many bars (for testing)")
+    p_ar.set_defaults(func=cmd_archive)
 
     return parser
 
