@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -112,6 +113,10 @@ class StubState:
     slow_close_polls: int = 0
     # Number of close requests to reject (422, non-retryable) before accepting.
     fail_close_times: int = 0
+    # Artificial per-request delay in seconds, to model a slow REST API.
+    rest_delay: float = 0.0
+    # Extra per-request delay (seconds) applied when the path contains the key.
+    slow_paths: dict[str, float] = field(default_factory=dict)
     # When true, GET /v1/accounts records but drops the response.
     drop_account_response: bool = False
     # Simulated current time in ms for the account risk snapshot.
@@ -172,6 +177,12 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         headers = {k: v for k, v in self.headers.items()}
         self.state.record(method, self.path, headers, body)
+        delay = self.state.rest_delay
+        for needle, extra in self.state.slow_paths.items():
+            if needle in self.path:
+                delay = max(delay, extra)
+        if delay:
+            time.sleep(delay)
 
         if self.state.fail_times.get(self.path, 0) > 0:
             self.state.fail_times[self.path] -= 1

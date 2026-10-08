@@ -766,6 +766,87 @@ def test_watchdog_idles_without_rest_while_halted_and_flat(stub_server, tmp_path
     assert len(state.requests) == baseline
 
 
+def test_watchdog_kills_promptly_despite_a_slow_candle_handler(stub_server, tmp_path, monkeypatch):
+    """A slow candle handler must not delay the watchdog's kill decision."""
+    import time
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+    # No trade here; only the position listing is slow (the account fetch the
+    # watchdog needs stays fast). The old code held the lock across this listing.
+    monkeypatch.setattr(bot, "_open_from_signal", lambda *a, **k: None)
+    state.slow_paths = {"/v1/positions": 1.0}
+
+    handler = threading.Thread(target=bot._process_candle, args=("binance|BTCUSDT", candle))
+    handler.start()
+    time.sleep(0.3)  # the handler is now mid-listing
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+
+    started = time.monotonic()
+    fired = bot.check_kill_now()
+    elapsed = time.monotonic() - started
+    handler.join(timeout=10)
+
+    assert fired
+    assert elapsed < 0.5, f"watchdog waited {elapsed:.2f}s for a slow candle handler"
+    assert bot.state.risk.halted
+
+
+def test_entry_not_sent_after_halt_during_a_slow_entry(stub_server, tmp_path, monkeypatch):
+    """A halt that lands mid-entry must stop the order from being sent."""
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+
+    # Simulate the watchdog halting the bot while the handler is between its
+    # signal and the order POST.
+    def halt_then_continue(market_id, side, size, entry, stop, tp):
+        bot.state.risk.halted = True
+        bot.state.risk.halt_reason = "race"
+        return bot._place_entry_original(market_id, side, size, entry, stop, tp)
+
+    bot._place_entry_original = bot._place_entry
+    monkeypatch.setattr(bot, "_place_entry", halt_then_continue)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_fill_after_halt_is_flattened(stub_server, tmp_path, monkeypatch):
+    """An entry already in flight when the kill fires is closed, not orphaned."""
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+
+    def halt_before_fill(market_id, created, pending):
+        bot.state.risk.halted = True
+        bot.state.risk.halt_reason = "race"
+        return bot._finish_entry_original(market_id, created, pending)
+
+    bot._finish_entry_original = bot._finish_entry
+    monkeypatch.setattr(bot, "_finish_entry", halt_before_fill)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    # The position opened by the in-flight order was closed by the flatten.
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert bot.state.owned_position_ids == []
+
+
 def test_history_replay_is_not_traded(stub_server, tmp_path):
     """300 historical candles with a crossover inside must not trade."""
     bot, state = build_bot(stub_server, tmp_path)

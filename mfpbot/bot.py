@@ -72,10 +72,20 @@ class Bot:
         # Injectable UTC clock for the daily guard / day rollover.
         self._now = lambda: datetime.now(timezone.utc)
         self._interval_ms = parse_interval_ms(config.timeframe)
-        # Serializes account/position/state mutation between the candle worker
-        # thread (P6 offloads the blocking REST work) and the poll watchdog.
-        # Reentrant so a locked section may call helpers that also lock.
+        # Serializes state mutation between the candle worker thread (P6
+        # offloads the blocking REST work) and the poll watchdog. Reentrant so a
+        # locked section may call helpers that also lock. Network calls are made
+        # OUTSIDE this lock, so a slow REST round-trip in the candle handler can
+        # never stall the watchdog's kill check.
         self._lock = threading.RLock()
+        # Serializes flatten attempts so the candle handler's kill path and the
+        # watchdog's retry do not close the same position twice. Held only around
+        # the flatten's REST work, never together with a request for _lock from
+        # another thread (callers of _flatten must not hold _lock).
+        self._flatten_lock = threading.Lock()
+        # Serializes pending-entry reconciliation. Acquired without blocking so
+        # the watchdog is never stuck behind a candle handler's REST lookup.
+        self._reconcile_lock = threading.Lock()
 
     # -- setup ------------------------------------------------------------
 
@@ -184,9 +194,15 @@ class Bot:
             sent_at=self.clock(),
             pre_position_ids=self._market_position_ids(market_id),
         )
-        self.state.pending_entries[client_order_id] = pending
-        self.state.last_entry_client_order_id = client_order_id
-        save_state(self.cfg.state_path, self.state)
+        with self._lock:
+            # A kill that landed between the signal and here must win: the halt
+            # flag is set before the order is sent, so no entry can slip out.
+            if self.state.risk.halted:
+                log.warning("%s: bot halted while preparing entry; not sending", market_id)
+                return None
+            self.state.pending_entries[client_order_id] = pending
+            self.state.last_entry_client_order_id = client_order_id
+            save_state(self.cfg.state_path, self.state)
 
         try:
             created = self.client.place_order(order, idempotency_key=idempotency_key)
@@ -231,6 +247,12 @@ class Bot:
         filled = self._await_order(market_id, created)
         if filled is not None:
             self._adopt_position(market_id, pending.pre_position_ids)
+            if self.state.risk.halted:
+                # The order was already in flight when the kill switch fired, so
+                # its position appeared after the flatten ran. Close it now so it
+                # is never left unmanaged on a halted account.
+                log.warning("%s: entry filled after halt; flattening the new position", market_id)
+                self._flatten()
         self._clear_pending(pending.client_order_id)
         save_state(self.cfg.state_path, self.state)
         return filled
@@ -238,12 +260,24 @@ class Bot:
     def _reconcile_pending_entry(self) -> bool:
         """Resolve every outstanding entry from a previous send.
 
-        Returns True if any entry is still unresolved. While any pending entry
-        exists (in any market) new entries are blocked, so a lost order can
-        never be duplicated.
+        Returns True if any entry is still unresolved, or if another thread is
+        already reconciling (in which case entries stay blocked). While any
+        pending entry exists new entries are blocked, so a lost order can never
+        be duplicated. Runs without ``_lock`` (it makes REST calls) and never
+        waits for the reconcile lock, so the watchdog is not delayed.
         """
+        if not self._reconcile_lock.acquire(blocking=False):
+            return True
+        try:
+            return self._reconcile_pending_entry_locked()
+        finally:
+            self._reconcile_lock.release()
+
+    def _reconcile_pending_entry_locked(self) -> bool:
         busy = False
-        for pending in list(self.state.pending_entries.values()):
+        with self._lock:
+            snapshot = list(self.state.pending_entries.values())
+        for pending in snapshot:
             try:
                 found = self.client.find_order_by_client_id(pending.client_order_id)
             except ApiError as exc:
@@ -310,21 +344,27 @@ class Bot:
         log.warning("%s: could not find the position from our fill; it still has broker-side SL/TP", market_id)
 
     def _remember_position(self, position_id: str) -> None:
-        if position_id not in self.state.owned_position_ids:
-            self.state.owned_position_ids.append(position_id)
+        with self._lock:
+            if position_id not in self.state.owned_position_ids:
+                self.state.owned_position_ids.append(position_id)
 
     def _forget_position(self, position_id: str) -> None:
-        if position_id in self.state.owned_position_ids:
-            self.state.owned_position_ids.remove(position_id)
+        with self._lock:
+            if position_id in self.state.owned_position_ids:
+                self.state.owned_position_ids.remove(position_id)
 
     def _owned_positions(self, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        owned = set(self.state.owned_position_ids)
+        with self._lock:
+            owned = set(self.state.owned_position_ids)
         return [p for p in positions if p["id"] in owned]
 
     def _prune_owned(self, positions: list[dict[str, Any]]) -> None:
         """Drop tracked IDs for positions that no longer exist (TP/SL/manual close)."""
         live = {p["id"] for p in positions}
-        self.state.owned_position_ids = [pid for pid in self.state.owned_position_ids if pid in live]
+        with self._lock:
+            self.state.owned_position_ids = [
+                pid for pid in self.state.owned_position_ids if pid in live
+            ]
 
     def _await_order(self, market_id: str, created: dict[str, Any], timeout: float = 20.0) -> Optional[dict[str, Any]]:
         status = created.get("status")
@@ -392,25 +432,32 @@ class Bot:
         if self.cfg.dry_run:
             log.info("[dry-run] would flatten bot positions for account %s", self.account["id"])
             return []
-        if self.cfg.flatten_scope == "account":
-            return self._flatten_account()
-        try:
-            positions = self._owned_positions(self._open_positions())
-        except ApiError as exc:
-            log.error("flatten: cannot list positions: %s", exc)
-            return []
-        if not positions:
-            log.info("flatten: no bot-owned positions to close")
-            return []
-        log.warning("flatten: closing %d bot-owned position(s)", len(positions))
-        for position in positions:
-            if self._close_position(position.get("market_id"), position):
-                self._wait_position_gone(position["id"], timeout=CLOSE_VERIFY_TIMEOUT)
-        try:
-            self._prune_owned(self._open_positions())
-        except ApiError as exc:
-            log.error("flatten: cannot verify positions after close: %s", exc)
-        return self._owned_positions(self._open_positions())
+        with self._flatten_lock:
+            if self.cfg.flatten_scope == "account":
+                return self._flatten_account()
+            with self._lock:
+                # Bot scope only closes positions it owns; nothing tracked means
+                # nothing to do, so skip the REST round-trip entirely.
+                if not self.state.owned_position_ids:
+                    log.info("flatten: no bot-owned positions to close")
+                    return []
+            try:
+                positions = self._owned_positions(self._open_positions())
+            except ApiError as exc:
+                log.error("flatten: cannot list positions: %s", exc)
+                return []
+            if not positions:
+                log.info("flatten: no bot-owned positions to close")
+                return []
+            log.warning("flatten: closing %d bot-owned position(s)", len(positions))
+            for position in positions:
+                if self._close_position(position.get("market_id"), position):
+                    self._wait_position_gone(position["id"], timeout=CLOSE_VERIFY_TIMEOUT)
+            try:
+                self._prune_owned(self._open_positions())
+            except ApiError as exc:
+                log.error("flatten: cannot verify positions after close: %s", exc)
+            return self._open_bot_positions()
 
     def _flatten_account(self) -> list[dict[str, Any]]:
         key = self.client.new_idempotency_key()
@@ -466,28 +513,29 @@ class Bot:
         status = self.account.get("status")
         if status in {"failed", "closed"}:
             log.error("account %s is %s; stopping trading", self.account["id"], status)
-            self.state.risk.halted = True
-            self.state.risk.halt_reason = f"account {status}"
-            save_state(self.cfg.state_path, self.state)
-            raise SystemExit(0)
-
-        equity = self._equity(account_risk)
-        self.risk.roll_day(self.state.risk, equity, now=self._now())
-
-        # The account kill switch must run before the position branch: a
-        # bot-owned position must never stop the daily loss / room floor guard
-        # from flattening and halting.
-        kill = self.risk.check_kill(self.state.risk, equity, account_risk)
-        if not kill.allowed:
-            log.error("kill switch: %s", kill.reason)
-            if kill.flatten:
-                self._flatten()
-                self.risk.halt(self.state.risk, kill.reason)
+            with self._lock:
+                self.state.risk.halted = True
+                self.state.risk.halt_reason = f"account {status}"
                 save_state(self.cfg.state_path, self.state)
-            return
+            raise SystemExit(0)
 
         # Resolve any entry left unconfirmed by a lost reply before acting.
         self._reconcile_pending_entry()
+
+        # The account kill switch must run before the position branch: a
+        # bot-owned position must never stop the daily loss / room floor guard
+        # from flattening and halting. The halt flag is set under a short lock
+        # (no REST), so the watchdog's kill path is never blocked by this
+        # handler's network work; the flatten then runs outside the lock.
+        with self._lock:
+            killed, reason = self._check_kill_locked(account_risk)
+        if killed:
+            log.error("kill switch: %s", reason)
+            self._flatten()
+            return
+
+        with self._lock:
+            equity = self._equity(account_risk)
 
         positions = self._open_positions()
         self._prune_owned(positions)
@@ -653,11 +701,34 @@ class Bot:
 
     # -- kill-switch watchdog ---------------------------------------------
 
+    def _check_kill_locked(self, account_risk: dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """Run the account kill switch with ``_lock`` held. No network calls.
+
+        ``account_risk`` is fetched by the caller outside the lock. Returns
+        ``(killed, reason)``. On a kill the halt flag is set and persisted
+        immediately, so no new entry can start afterwards. The caller is
+        responsible for flattening (outside the lock).
+        """
+        if self.state.risk.halted:
+            if self.state.risk.day == _utc_day(self._now()):
+                return True, None
+            # The UTC day rolled over: roll_day below clears the halt so the new
+            # day is guarded like any other.
+        equity = self._equity(account_risk)
+        self.risk.roll_day(self.state.risk, equity, now=self._now())
+        kill = self.risk.check_kill(self.state.risk, equity, account_risk)
+        if kill.allowed:
+            return False, None
+        self.risk.halt(self.state.risk, kill.reason)
+        save_state(self.cfg.state_path, self.state)
+        return True, kill.reason
+
     def check_kill_now(self) -> bool:
         """Run the account kill switch once, independently of candles.
 
         Returns True when the bot is (or becomes) halted. Safe to call from any
-        thread; state mutation is serialized by ``self._lock``.
+        thread. The halt flag is set under a short lock; the flatten runs outside
+        the lock so a slow candle handler can never delay the kill decision.
 
         While halted the watchdog stays quiet (no REST) unless the UTC day has
         changed, in which case ``roll_day`` clears the halt so the new day is
@@ -665,32 +736,30 @@ class Bot:
         would silently leave the account unprotected on the following day.
         """
         with self._lock:
-            if self.state.risk.halted:
-                if self.state.risk.day == _utc_day(self._now()):
-                    # Already halted today: no new entries are possible. Keep
-                    # retrying the flatten until every bot-owned position is
-                    # actually closed, then go quiet. Ownership is only dropped
-                    # once a position is confirmed gone (Q3), so a non-empty set
-                    # is the authoritative signal that something is still open —
-                    # and an empty one means no REST is needed at all.
-                    if self.state.owned_position_ids:
-                        self._retry_flatten_while_halted()
-                    return True
-                # The UTC day rolled over: roll_day below clears the halt so the
-                # new day is guarded like any other.
-            self._reconcile_pending_entry()
-            account_risk = self._refresh_account()
-            equity = self._equity(account_risk)
-            self.risk.roll_day(self.state.risk, equity, now=self._now())
-            kill = self.risk.check_kill(self.state.risk, equity, account_risk)
-            if kill.allowed:
-                return False
-            log.error("watchdog kill switch: %s", kill.reason)
-            if kill.flatten:
-                self._flatten()
-                self.risk.halt(self.state.risk, kill.reason)
-                save_state(self.cfg.state_path, self.state)
+            halted_today = self.state.risk.halted and self.state.risk.day == _utc_day(self._now())
+            needs_flatten = bool(self.state.owned_position_ids)
+        if halted_today:
+            # Already halted today: no new entries are possible. Keep retrying
+            # the flatten until every bot-owned position is closed, then go
+            # quiet. Ownership is only dropped once a position is confirmed gone
+            # (Q3), so a non-empty set means something is still open, and an
+            # empty one needs no REST at all.
+            if needs_flatten:
+                self._retry_flatten_while_halted()
             return True
+        # Either not halted, or the UTC day rolled over: fall through so
+        # roll_day clears the halt and the new day is guarded normally. Fetch
+        # the snapshot and reconcile outside the lock (both make REST calls).
+        account_risk = self._refresh_account()
+        self._reconcile_pending_entry()
+        with self._lock:
+            killed, reason = self._check_kill_locked(account_risk)
+        if not killed:
+            return False
+        # Flatten outside the lock so the watchdog is never blocked by it.
+        log.error("watchdog kill switch: %s", reason)
+        self._flatten()
+        return True
 
     async def _watchdog(self) -> None:
         """Poll the account between candles so guards fire even with no signal.
@@ -801,8 +870,10 @@ class Bot:
         attempt = 0
         while True:
             try:
+                # Handle outside the lock: on_closed_candle makes REST calls, and
+                # holding _lock across them would stall the watchdog's kill check.
+                self.on_closed_candle(market_id, candle)
                 with self._lock:
-                    self.on_closed_candle(market_id, candle)
                     self.state.last_processed_open_time[market_id] = candle.open_time
                     self._rotation += 1
                     save_state(self.cfg.state_path, self.state)
