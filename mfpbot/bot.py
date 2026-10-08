@@ -33,6 +33,8 @@ MAX_ENTRY_DRIFT = 0.05
 # A candle is only acted on if its close is within this many intervals of now;
 # older bars are history/backfill and must never trigger a live order.
 FRESHNESS_INTERVALS = 1.5
+# Retry delays (seconds) when a fresh candle hits a transient REST error.
+FRESH_CANDLE_RETRY_DELAYS = (2.0, 5.0)
 
 
 class Bot:
@@ -682,10 +684,38 @@ class Bot:
             if not self._is_fresh(candle):
                 self.state.last_processed_open_time[market_id] = candle.open_time
                 return
-            self.on_closed_candle(market_id, candle)
-            self.state.last_processed_open_time[market_id] = candle.open_time
-            self._rotation += 1
-            save_state(self.cfg.state_file, self.state)
+        self._handle_fresh_candle(market_id, candle)
+
+    def _handle_fresh_candle(self, market_id: str, candle: Candle) -> None:
+        """Handle one fresh candle, retrying transient REST errors.
+
+        The processed cursor advances only after the candle is handled, so a
+        failure leaves it eligible for a retry instead of being silently dropped.
+        """
+        delays = list(FRESH_CANDLE_RETRY_DELAYS)
+        attempt = 0
+        while True:
+            try:
+                with self._lock:
+                    self.on_closed_candle(market_id, candle)
+                    self.state.last_processed_open_time[market_id] = candle.open_time
+                    self._rotation += 1
+                    save_state(self.cfg.state_file, self.state)
+                return
+            except ApiError as exc:
+                if attempt >= len(delays):
+                    log.error(
+                        "%s: giving up on candle %s after %d attempts: %s",
+                        market_id, candle.open_time, attempt + 1, exc,
+                    )
+                    return
+                delay = delays[attempt]
+                attempt += 1
+                log.warning(
+                    "%s: transient error on candle %s (%s); retrying in %.0fs",
+                    market_id, candle.open_time, exc, delay,
+                )
+                time.sleep(delay)
 
     def _is_fresh(self, candle: Candle) -> bool:
         """True when the candle closed recently enough to act on."""

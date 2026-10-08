@@ -369,6 +369,53 @@ def test_run_offloads_candle_work_to_a_worker_thread(stub_server, tmp_path, monk
     assert len(state.orders) == 1  # the trade still happened
 
 
+def test_transient_candle_error_is_retried_without_reordering(stub_server, tmp_path, monkeypatch):
+    """A transient REST failure must retry the candle, not skip or double-trade it."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+    state.fail_times["/v1/accounts/acct-1"] = 99  # first attempt fails
+    monkeypatch.setattr(bot_module.time, "sleep", lambda _s: None)
+
+    attempts = {"n": 0}
+    real = bot.on_closed_candle
+
+    def counting(market_id, c):
+        attempts["n"] += 1
+        if attempts["n"] == 2:
+            state.fail_times["/v1/accounts/acct-1"] = 0  # recover on the retry
+        return real(market_id, c)
+
+    monkeypatch.setattr(bot, "on_closed_candle", counting)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    assert attempts["n"] == 2
+    assert len(state.orders) == 1
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.last_processed_open_time["binance|BTCUSDT"] == candle.open_time
+
+
+def test_candle_cursor_not_advanced_when_all_attempts_fail(stub_server, tmp_path, monkeypatch):
+    """A candle must not be marked processed until it is actually handled."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+    state.fail_times["/v1/accounts/acct-1"] = 99  # never recovers
+    monkeypatch.setattr(bot_module.time, "sleep", lambda _s: None)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    assert bot.state.last_processed_open_time.get("binance|BTCUSDT") is None
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
 def _owned_short(state, market_id="binance|BTCUSDT", position_id="pos-1"):
     state.positions = [{
         "id": position_id, "account_id": "acct-1", "market_id": market_id,
