@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -12,6 +15,16 @@ from typing import Any, Optional
 from .risk.manager import RiskState
 
 log = logging.getLogger("mfpbot.state")
+
+# Serializes every write to a state file. ``save_state`` is called from the
+# candle worker thread and the watchdog, so serialization and the swap must not
+# interleave. The lock is never held across network I/O.
+_SAVE_LOCK = threading.Lock()
+
+
+class StateLoadError(RuntimeError):
+    """Raised when an existing state file cannot be read and a fresh start is
+    not allowed (live, non-dry-run)."""
 
 
 @dataclass
@@ -89,32 +102,89 @@ class BotState:
         )
 
 
-def load_state(path: str | os.PathLike[str]) -> BotState:
+def _read_state_file(p: Path) -> BotState:
+    return BotState.from_dict(json.loads(p.read_text(encoding="utf-8")))
+
+
+def load_state(
+    path: str | os.PathLike[str],
+    *,
+    allow_fresh: bool = True,
+    environment: str = "sandbox",
+    dry_run: bool = False,
+) -> BotState:
+    """Load state, recovering from ``.bak`` and refusing a silent fresh start.
+
+    A missing file is a genuine new state. An *existing* file that cannot be
+    parsed falls back to the ``.bak`` copy. When both are unreadable, a live,
+    non-dry-run bot must not silently lose ownership/pending/daily counters: it
+    raises :class:`StateLoadError` unless ``allow_fresh`` (``FP_ALLOW_FRESH_STATE``)
+    is set. Sandbox and dry runs warn and start fresh.
+    """
     p = Path(path)
     if not p.exists():
         return BotState()
     try:
-        return BotState.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        return _read_state_file(p)
     except (ValueError, OSError) as exc:
-        log.warning("could not read state file %s (%s); starting fresh", p, exc)
-        return BotState()
+        log.warning("state file %s is unreadable (%s); trying %s.bak", p, exc, p)
+    bak = p.with_name(p.name + ".bak")
+    if bak.exists():
+        try:
+            state = _read_state_file(bak)
+            log.warning("recovered state from %s", bak)
+            return state
+        except (ValueError, OSError) as exc:
+            log.warning("backup state file %s is also unreadable (%s)", bak, exc)
+    if environment == "live" and not dry_run and not allow_fresh:
+        raise StateLoadError(
+            f"state file {p} and its backup are unreadable, and a fresh start is "
+            "not allowed in live mode (it would drop owned positions, pending "
+            "entries and daily counters). Restore the file or set "
+            "FP_ALLOW_FRESH_STATE=true to start empty deliberately."
+        )
+    log.warning("starting from empty state: %s and its backup are unreadable", p)
+    return BotState()
+
+
+def _write_atomic(p: Path, payload: str) -> None:
+    """Write ``payload`` next to ``p`` and atomically swap it into place."""
+    fd, tmp_name = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp", dir=str(p.parent or "."))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, p)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def save_state(path: str | os.PathLike[str], state: BotState) -> None:
-    """Persist state atomically, but never let a write failure stop the bot."""
+    """Persist state atomically under a lock; never let a failure stop the bot."""
     p = Path(path)
     payload = json.dumps(state.to_dict(), indent=2)
-    tmp = p.with_name(p.name + ".tmp")
-    try:
-        if p.parent and not p.parent.exists():
-            p.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, p)
-        return
-    except OSError as exc:
-        log.warning("atomic state save failed (%s); trying direct write", exc)
-    try:
-        tmp.unlink(missing_ok=True)
-        p.write_text(payload, encoding="utf-8")
-    except OSError as exc:
-        log.error("could not persist state to %s: %s", p, exc)
+    with _SAVE_LOCK:
+        try:
+            if p.parent and not p.parent.exists():
+                p.parent.mkdir(parents=True, exist_ok=True)
+            bak = p.with_name(p.name + ".bak")
+            if p.exists():
+                try:
+                    shutil.copy2(p, bak)
+                except OSError as exc:
+                    log.debug("could not refresh %s: %s", bak, exc)
+            _write_atomic(p, payload)
+            return
+        except OSError as exc:
+            log.warning("atomic state save failed (%s); trying direct write", exc)
+        # A non-atomic fallback, only after the atomic path failed (and only for
+        # non-race errors, since the lock already excludes concurrent writers).
+        try:
+            p.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            log.error("could not persist state to %s: %s", p, exc)

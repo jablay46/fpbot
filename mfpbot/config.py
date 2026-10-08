@@ -74,6 +74,9 @@ class Config:
     log_level: str = "INFO"
     state_file: str = "bot_state.json"
     dry_run: bool = False
+    # Allow a live run to start from empty state when the file and its backup
+    # are unreadable (otherwise it refuses, to avoid dropping ownership).
+    allow_fresh_state: bool = False
 
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -224,6 +227,7 @@ _ENV_KEYS = {
     "log_level": "FP_LOG_LEVEL",
     "state_file": "FP_STATE_FILE",
     "dry_run": "FP_DRY_RUN",
+    "allow_fresh_state": "FP_ALLOW_FRESH_STATE",
 }
 
 _FLOAT_FIELDS = {
@@ -239,7 +243,7 @@ _FLOAT_FIELDS = {
     "poll_seconds",
 }
 _INT_FIELDS = {"ema_fast", "ema_slow", "atr_period", "max_daily_trades"}
-_BOOL_FIELDS = {"dry_run", "ack_no_drawdown_guard"}
+_BOOL_FIELDS = {"dry_run", "ack_no_drawdown_guard", "allow_fresh_state"}
 _LIST_FIELDS = {"symbols"}
 
 

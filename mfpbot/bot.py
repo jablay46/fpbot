@@ -53,7 +53,12 @@ class Bot:
     ) -> None:
         self.cfg = config
         self.client = client or MfpClient(config.api_key, config.base_url)
-        self.state = state or load_state(config.state_path)
+        self.state = state or load_state(
+            config.state_path,
+            allow_fresh=config.allow_fresh_state,
+            environment=config.environment,
+            dry_run=config.dry_run,
+        )
         self.strategy = build_strategy(
             config.strategy,
             fast=config.ema_fast,
@@ -152,6 +157,17 @@ class Bot:
 
     # -- helpers ----------------------------------------------------------
 
+    def _persist(self) -> None:
+        """Serialize and save state while holding ``_lock``.
+
+        Holding the lock across serialization stops it racing with a concurrent
+        state mutation (which would raise "dictionary changed size during
+        iteration" or persist a half-updated view). ``_lock`` is reentrant, so a
+        caller already holding it is safe; no network I/O happens here.
+        """
+        with self._lock:
+            save_state(self.cfg.state_path, self.state)
+
     def _refresh_account(self) -> dict[str, Any]:
         self.account = self.client.get_account(self.account["id"])
         return self.account.get("risk") or {}
@@ -230,7 +246,7 @@ class Bot:
                 return None
             self.state.pending_entries[client_order_id] = pending
             self.state.last_entry_client_order_id = client_order_id
-            save_state(self.cfg.state_path, self.state)
+            self._persist()
 
         try:
             created = self.client.place_order(order, idempotency_key=idempotency_key)
@@ -253,12 +269,12 @@ class Bot:
                 market_id, pending.client_order_id, lookup_exc,
             )
             # Keep the pending entry so the next candle / watchdog retries the lookup.
-            save_state(self.cfg.state_path, self.state)
+            self._persist()
             return None
         if found is None:
             log.warning("%s: order %s was not accepted; treating as not sent", market_id, pending.client_order_id)
             self._clear_pending(pending.client_order_id)
-            save_state(self.cfg.state_path, self.state)
+            self._persist()
             return None
         log.info("%s: reconciled order %s after a lost reply", market_id, pending.client_order_id)
         filled, _ = self._finish_entry(market_id, found, pending)
@@ -295,7 +311,7 @@ class Bot:
                 "%s: order %s is still %s; keeping it pending",
                 market_id, final.get("id"), final.get("status"),
             )
-        save_state(self.cfg.state_path, self.state)
+        self._persist()
         return filled, resolved
 
     def _reconcile_pending_entry(self) -> bool:
@@ -334,7 +350,7 @@ class Bot:
                     pending.market_id, pending.client_order_id,
                 )
                 self._clear_pending(pending.client_order_id)
-                save_state(self.cfg.state_path, self.state)
+                self._persist()
                 continue
             log.info("%s: resolving pending entry %s", pending.market_id, pending.client_order_id)
             filled, resolved = self._finish_entry(pending.market_id, found, pending)
@@ -342,7 +358,7 @@ class Bot:
                 busy = True
             elif filled is not None:
                 self.risk.record_entry(self.state.risk)
-                save_state(self.cfg.state_path, self.state)
+                self._persist()
         return busy
 
     def _market_position_ids(self, market_id: str) -> list[str]:
@@ -381,7 +397,7 @@ class Bot:
                 ):
                     self._remember_position(pos["id"])
                     log.info("%s: adopted position %s (%s)", market_id, pos["id"], pos.get("side"))
-                    save_state(self.cfg.state_path, self.state)
+                    self._persist()
                     return
             time.sleep(delay)
             delay = min(delay * 1.5, 2.0)
@@ -567,7 +583,7 @@ class Bot:
             with self._lock:
                 self.state.risk.halted = True
                 self.state.risk.halt_reason = f"account {status}"
-                save_state(self.cfg.state_path, self.state)
+                self._persist()
             raise SystemExit(0)
 
         # Resolve any entry left unconfirmed by a lost reply before acting.
@@ -748,7 +764,7 @@ class Bot:
         filled = self._place_entry(market_id, side, sizing.size, entry, stop, tp)
         if filled is not None:
             self.risk.record_entry(self.state.risk)
-            save_state(self.cfg.state_path, self.state)
+            self._persist()
 
     # -- kill-switch watchdog ---------------------------------------------
 
@@ -769,7 +785,7 @@ class Bot:
                 self.state.risk.total_drawdown_halted = True
                 self.state.risk.total_drawdown_reason = total.reason
                 log.error("total drawdown kill switch: %s", total.reason)
-            save_state(self.cfg.state_path, self.state)
+            self._persist()
             return True, total.reason
         if self.state.risk.total_drawdown_halted:
             return True, self.state.risk.total_drawdown_reason
@@ -783,7 +799,7 @@ class Bot:
         if kill.allowed:
             return False, None
         self.risk.halt(self.state.risk, kill.reason)
-        save_state(self.cfg.state_path, self.state)
+        self._persist()
         return True, kill.reason
 
     def check_kill_now(self) -> bool:
@@ -956,7 +972,7 @@ class Bot:
                 with self._lock:
                     self.state.last_processed_open_time[market_id] = candle.open_time
                     self._rotation += 1
-                    save_state(self.cfg.state_path, self.state)
+                    self._persist()
                 return
             except ApiError as exc:
                 if attempt >= len(delays):

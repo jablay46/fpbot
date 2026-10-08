@@ -14,7 +14,7 @@ from typing import Any
 from .bot import Bot
 from .client import ApiError, MfpClient
 from .config import ConfigError, load_config, load_dotenv_file
-from .state import load_state, save_state
+from .state import StateLoadError, load_state, save_state
 from .util import fmt
 
 
@@ -82,7 +82,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         cfg.dry_run = True
     _setup_logging(cfg.log_level)
-    bot = Bot(cfg)
+    try:
+        bot = Bot(cfg)
+    except StateLoadError as exc:
+        # Refuse to start a live run from empty state: that would silently drop
+        # owned positions, pending entries and daily counters.
+        print(f"state error: {exc}", file=sys.stderr)
+        return 2
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
