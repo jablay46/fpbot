@@ -120,6 +120,12 @@ class StubState:
     slow_close_polls: int = 0
     # Number of close requests to reject (422, non-retryable) before accepting.
     fail_close_times: int = 0
+    # Working TP/SL exit legs guarding open positions (for exit management).
+    exit_orders: list[dict[str, Any]] = field(default_factory=list)
+    # Number of exit-order updates to reject with 409 (stale snapshot).
+    exit_conflict_times: int = 0
+    # Number of exit-order updates to reject with 422 (non-retryable).
+    fail_exit_times: int = 0
     # Artificial per-request delay in seconds, to model a slow REST API.
     rest_delay: float = 0.0
     # Extra per-request delay (seconds) applied when the path contains the key.
@@ -277,10 +283,30 @@ class _Handler(BaseHTTPRequestHandler):
                 # so the client exhausts its retries and raises.
                 return
             self._send(201, {"data": existing})
+        elif path.startswith("/v1/positions/") and path.endswith("/exit-orders") and method == "PUT":
+            if self.state.exit_conflict_times > 0:
+                self.state.exit_conflict_times -= 1
+                self._send(409, {"error": {"code": "conflict", "message": "stale snapshot"}})
+                return
+            if self.state.fail_exit_times > 0:
+                self.state.fail_exit_times -= 1
+                self._send(422, {"error": {"code": "rejected", "message": "bad exit price"}})
+                return
+            for op in (body or {}).get("operations") or []:
+                for leg in self.state.exit_orders:
+                    if op.get("order_id") and leg.get("id") == op["order_id"] and op.get("kind") == "modify":
+                        leg["trigger_price"] = op["price"]
+            self._send(200, {"data": {"id": "pos-x", "status": "open"}})
         elif path == "/v1/orders" and method == "GET":
             if self.state.fail_order_lookup_times > 0:
                 self.state.fail_order_lookup_times -= 1
                 self._send(503, {"error": {"code": "unavailable", "message": "try later"}})
+                return
+            if query.get("status", [None])[0] == "working":
+                live = [o for o in self.state.orders
+                        if o.get("status") not in ("filled", "rejected", "canceled", "cancelled", "expired")]
+                self._send(200, {"data": {"data": list(self.state.exit_orders) + live,
+                                          "has_more": False, "next_cursor": None}})
                 return
             rows = list(self.state.orders)
             wanted = query.get("client_order_id", [None])[0]

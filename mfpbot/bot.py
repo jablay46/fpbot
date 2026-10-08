@@ -19,10 +19,11 @@ from typing import Any, Optional
 from .client import ApiError, MfpClient
 from .config import Config
 from .market_stream import Candle, CandleSeries, MarketDataStream
-from .risk.manager import RiskManager, RiskState, _utc_day
+from .risk.manager import RiskManager, RiskState, day_key
 from .risk.sizing import PositionSizer
-from .state import BotState, PendingEntry, load_state, save_state
+from .state import BotState, PendingEntry, PositionTrade, load_state, save_state
 from .strategy import build_strategy
+from .strategy.indicators import atr as atr_series
 from .util import fmt, parse_interval_ms
 
 log = logging.getLogger("mfpbot.bot")
@@ -155,7 +156,12 @@ class Bot:
             missing_room_policy=self.cfg.missing_room_policy,
             max_total_drawdown_pct=self.cfg.max_total_drawdown_pct,
             drawdown_basis=self.cfg.drawdown_basis,
+            day_tz=self.cfg.day_timezone,
         )
+
+    def _today(self) -> str:
+        """Current day key on the firm's day boundary (default ET midnight)."""
+        return day_key(self._now(), self.cfg.day_timezone)
 
     def _check_safety_config_or_raise(self) -> None:
         """Refuse to start a live run that cannot enforce a cumulative guard.
@@ -219,7 +225,8 @@ class Bot:
     # -- trading actions --------------------------------------------------
 
     def _place_entry(
-        self, market_id: str, side: str, size: float, entry: float, stop: float, tp: float
+        self, market_id: str, side: str, size: float, entry: float, stop: float, tp: float,
+        leverage: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         client_order_id = f"mfpbot:{market_id}:{uuid.uuid4().hex[:12]}"
         idempotency_key = self.client.new_idempotency_key()
@@ -231,7 +238,9 @@ class Bot:
             "side": side,
             "size": size,
             "expected_price": entry,
-            "leverage": self.cfg.leverage,
+            # Never send more leverage than the market allows: the sizer clamps
+            # for its margin math, and the order must match that clamp.
+            "leverage": leverage if leverage is not None else self.cfg.leverage,
             "margin_mode": self.cfg.margin_mode,
             "take_profit_price": tp,
             "stop_loss_price": stop,
@@ -257,6 +266,9 @@ class Bot:
             idempotency_key=idempotency_key,
             sent_at=self.clock(),
             pre_position_ids=pre_position_ids,
+            side=side,
+            stop=stop,
+            take_profit=tp,
         )
         with self._lock:
             # A kill that landed between the signal and here must win: the halt
@@ -316,7 +328,7 @@ class Bot:
         final = self._await_order(market_id, created)
         filled = final if final.get("status") == "filled" else None
         if filled is not None:
-            self._adopt_position(market_id, pending.pre_position_ids)
+            self._adopt_position(market_id, pending.pre_position_ids, pending=pending, entry_order=final)
             if self.state.risk.halted:
                 # The order was already in flight when the kill switch fired, so
                 # its position appeared after the flatten ran. Close it now so it
@@ -391,14 +403,17 @@ class Bot:
         return [p["id"] for p in self._open_positions() if p.get("market_id") == market_id]
 
     def _adopt_position(
-        self, market_id: str, pre_position_ids: Optional[list[str]] = None, timeout: float = 8.0
+        self, market_id: str, pre_position_ids: Optional[list[str]] = None, timeout: float = 8.0,
+        pending: Optional[PendingEntry] = None, entry_order: Optional[dict[str, Any]] = None,
     ) -> None:
         """Link the position our fill created so the bot manages it.
 
         Entry orders do not return a position_id, so match the freshly opened
         position on this market. Only positions that did not exist before the
         order are ours, which keeps a lagging closed position (reversal) or a
-        manual position from being mis-adopted.
+        manual position from being mis-adopted. The sent levels are recorded
+        against the actual fill price so the breakeven/trailing manager knows
+        the trade's 1R distance (the API's Position carries no stop/target).
         """
         pre = set(pre_position_ids or [])
         deadline = time.monotonic() + timeout
@@ -416,12 +431,40 @@ class Bot:
                     and pos["id"] not in self.state.owned_position_ids
                 ):
                     self._remember_position(pos["id"])
+                    self._record_trade(pos, pending, entry_order)
                     log.info("%s: adopted position %s (%s)", market_id, pos["id"], pos.get("side"))
                     self._persist()
                     return
             time.sleep(delay)
             delay = min(delay * 1.5, 2.0)
         log.warning("%s: could not find the position from our fill; it still has broker-side SL/TP", market_id)
+
+    def _record_trade(
+        self,
+        position: dict[str, Any],
+        pending: Optional[PendingEntry],
+        entry_order: Optional[dict[str, Any]],
+    ) -> None:
+        """Persist the levels of a newly adopted position for exit management."""
+        if pending is None or pending.stop <= 0:
+            return
+        entry = float(position.get("entry_price") or 0.0)
+        risk_distance = abs(entry - pending.stop) if entry > 0 else 0.0
+        if risk_distance <= 0:
+            return
+        side = position.get("side") or ("long" if pending.side == "buy" else "short")
+        trade = PositionTrade(
+            position_id=position["id"],
+            market_id=position.get("market_id") or pending.market_id,
+            side=side,
+            entry=entry,
+            risk_distance=risk_distance,
+            take_profit=pending.take_profit,
+            last_stop=pending.stop,
+            entry_order_id=(entry_order or {}).get("id"),
+        )
+        with self._lock:
+            self.state.position_trades[position["id"]] = trade
 
     def _remember_position(self, position_id: str) -> None:
         with self._lock:
@@ -432,6 +475,7 @@ class Bot:
         with self._lock:
             if position_id in self.state.owned_position_ids:
                 self.state.owned_position_ids.remove(position_id)
+            self.state.position_trades.pop(position_id, None)
 
     def _owned_positions(self, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         with self._lock:
@@ -445,6 +489,8 @@ class Bot:
             self.state.owned_position_ids = [
                 pid for pid in self.state.owned_position_ids if pid in live
             ]
+            for pid in [pid for pid in self.state.position_trades if pid not in live]:
+                del self.state.position_trades[pid]
 
     def _await_order(self, market_id: str, created: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
         """Poll an order until it reaches a terminal state or the wait expires.
@@ -509,6 +555,215 @@ class Bot:
             return False
         log.info("%s: close submitted for position %s (%s)", market_id, position["id"], position.get("side"))
         return True
+
+    # -- exit management (breakeven + trailing) -----------------------------
+
+    @staticmethod
+    def _leg_price(order: dict[str, Any]) -> Optional[float]:
+        for key in ("trigger_price", "limit_price", "price", "expected_price"):
+            value = order.get(key)
+            if value:
+                return float(value)
+        return None
+
+    @staticmethod
+    def _leg_execution_type(order: dict[str, Any]) -> Optional[str]:
+        kind = str(order.get("type") or order.get("mode") or "")
+        if kind.endswith("_market"):
+            return "market"
+        if kind.endswith("_limit"):
+            return "limit"
+        return None
+
+    def _exit_legs(self, position: dict[str, Any]) -> Optional[tuple[Optional[dict[str, Any]], list[dict[str, Any]]]]:
+        """Snapshot the working TP/SL legs guarding one position.
+
+        Returns ``(stop_leg_or_None, other_legs)``. ``None`` means the legs
+        cannot be identified safely (ambiguous legs, or the lookup failed):
+        the caller must skip the move rather than touch the wrong order.
+        Makes REST calls, so callers must not hold ``_lock``.
+        """
+        market_id = position.get("market_id")
+        try:
+            data = self.client.list_orders(account_id=self.account["id"], status="working")
+        except ApiError as exc:
+            log.warning("%s: cannot list working exits for %s: %s", market_id, position.get("id"), exc)
+            return None
+        rows, _ = MfpClient._unwrap_orders(data)
+        legs = [o for o in rows if o.get("market_id") == market_id and o.get("reduce_only")]
+        entry = float(position.get("entry_price") or 0.0)
+        is_long = (position.get("side") or "long") == "long"
+        stops: list[dict[str, Any]] = []
+        others: list[dict[str, Any]] = []
+        for leg in legs:
+            kind = str(leg.get("type") or leg.get("mode") or "")
+            if kind.startswith("stop"):
+                stops.append(leg)
+            elif kind.startswith("take"):
+                others.append(leg)
+            else:
+                price = self._leg_price(leg)
+                if price is not None and entry > 0:
+                    # Fall back to geometry: the leg on the loss side of entry
+                    # is the stop, the one on the profit side is the target.
+                    loss_side = (is_long and price < entry) or (not is_long and price > entry)
+                    (stops if loss_side else others).append(leg)
+                else:
+                    # Unknown leg: keep it in the snapshot untouched.
+                    others.append(leg)
+        if len(stops) > 1:
+            log.warning(
+                "%s: %d stop legs on position %s; refusing to guess which is ours",
+                market_id, len(stops), position.get("id"),
+            )
+            return None
+        return (stops[0] if stops else None, others)
+
+    def _move_stop(self, position: dict[str, Any], new_stop: float) -> bool:
+        """Move a position's broker-side stop via the guarded exit-orders batch.
+
+        Re-reads the working legs first and retries once on a 409 (stale
+        snapshot). A rejection (422, e.g. the price is on the wrong side) or an
+        ambiguous leg set fails safe: the old stop stays in force and the move
+        is retried on the next candle. Makes REST calls; do not hold ``_lock``.
+        """
+        market_id = position.get("market_id")
+        size = float(position.get("size") or 0.0)
+        if size <= 0:
+            return False
+        for attempt in range(2):
+            snapshot = self._exit_legs(position)
+            if snapshot is None:
+                return False
+            stop_leg, others = snapshot
+            expected: list[dict[str, Any]] = []
+            for leg in ([stop_leg] if stop_leg else []) + others:
+                price = self._leg_price(leg)
+                leg_size = float(leg.get("size") or 0.0)
+                if price is None or leg_size <= 0:
+                    log.warning(
+                        "%s: exit leg %s has no usable price/size; skipping move",
+                        market_id, leg.get("id"),
+                    )
+                    return False
+                item: dict[str, Any] = {"order_id": leg["id"], "price": price, "size": leg_size}
+                exec_type = self._leg_execution_type(leg)
+                if exec_type:
+                    item["execution_type"] = exec_type
+                expected.append(item)
+            if stop_leg is not None:
+                operations = [{"kind": "modify", "order_id": stop_leg["id"], "price": new_stop}]
+            else:
+                # The stop leg is gone (manually canceled?) while the position
+                # is still open: re-place it instead of modifying.
+                log.warning(
+                    "%s: stop leg missing on %s; re-placing at %s",
+                    market_id, position.get("id"), fmt(new_stop),
+                )
+                operations = [{
+                    "kind": "place", "group": "sl", "execution_type": "market",
+                    "price": new_stop, "size": size,
+                }]
+            try:
+                self.client.set_exit_orders(
+                    position["id"],
+                    {
+                        "expected_position_size": size,
+                        "expected_orders": expected,
+                        "operations": operations,
+                    },
+                )
+                return True
+            except ApiError as exc:
+                if exc.status == 409 and attempt == 0:
+                    log.info("%s: exit snapshot stale (409); refreshing once", market_id)
+                    continue
+                log.warning("%s: could not move stop on %s: %s", market_id, position.get("id"), exc)
+                return False
+        return False
+
+    def _candle_atr(self, market_id: str) -> Optional[float]:
+        """Current ATR over closed candles, for the trailing stop."""
+        series = self.series.get(market_id)
+        if series is None:
+            return None
+        closed = series.closed
+        if len(closed) < self.cfg.atr_period:
+            return None
+        values = atr_series(
+            [c.high for c in closed], [c.low for c in closed], [c.close for c in closed],
+            self.cfg.atr_period,
+        )
+        return values[-1] if values else None
+
+    def _manage_exits(self, market_id: str, position: dict[str, Any], candle: Candle) -> None:
+        """Ratchet an owned position's stop: breakeven first, then ATR trailing.
+
+        Evaluated once per closed candle from that candle's extremes, so live
+        behavior matches what the backtester models bar-by-bar. The stop only
+        ever tightens; the take profit is left alone (whichever level is
+        touched first wins on the broker side). Makes REST calls; the trade
+        record is mutated without ``_lock`` (attribute sets are atomic and the
+        persist serializes under it), so a concurrent prune can only drop an
+        already-gone position's update — never corrupt the state.
+        """
+        if self.cfg.breakeven_at_r <= 0 and self.cfg.trail_atr_mult <= 0:
+            return
+        trade = self.state.position_trades.get(position["id"])
+        if trade is None:
+            log.debug("%s: no trade levels for %s; skipping exit management",
+                      market_id, position.get("id"))
+            return
+        if trade.entry <= 0 or trade.risk_distance <= 0:
+            return
+        is_long = (trade.side or position.get("side") or "long") == "long"
+        extreme = candle.high if is_long else candle.low
+        excursion = (extreme - trade.entry) if is_long else (trade.entry - extreme)
+        desired = trade.last_stop
+        move: Optional[str] = None
+        if (
+            self.cfg.breakeven_at_r > 0
+            and not trade.breakeven_done
+            and excursion >= self.cfg.breakeven_at_r * trade.risk_distance
+        ):
+            if is_long:
+                desired = trade.entry + self.cfg.breakeven_plus_r * trade.risk_distance
+            else:
+                desired = trade.entry - self.cfg.breakeven_plus_r * trade.risk_distance
+            move = "breakeven"
+        if self.cfg.trail_atr_mult > 0:
+            peak = extreme if trade.peak is None else (
+                max(trade.peak, extreme) if is_long else min(trade.peak, extreme)
+            )
+            trade.peak = peak
+            atr_now = self._candle_atr(market_id)
+            if atr_now is not None and atr_now > 0:
+                trail = peak - self.cfg.trail_atr_mult * atr_now if is_long else \
+                    peak + self.cfg.trail_atr_mult * atr_now
+                if (is_long and trail > desired) or (not is_long and trail < desired):
+                    desired, move = trail, "trailing"
+        # The stop only tightens; never widen it.
+        if (is_long and desired <= trade.last_stop) or (not is_long and desired >= trade.last_stop):
+            self._persist()
+            return
+        if self.cfg.dry_run:
+            log.info("[dry-run] %s: would move stop on %s to %s (%s)",
+                     market_id, position["id"], fmt(desired), move)
+            trade.last_stop = desired
+            if move == "breakeven":
+                trade.breakeven_done = True
+            elif move == "trailing":
+                trade.trailing = True
+            self._persist()
+            return
+        if self._move_stop(position, desired):
+            log.info("%s: moved stop on %s to %s (%s)", market_id, position["id"], fmt(desired), move)
+            trade.last_stop = desired
+            if move == "breakeven":
+                trade.breakeven_done = True
+            elif move == "trailing":
+                trade.trailing = True
+        self._persist()
 
     def _flatten(self) -> list[dict[str, Any]]:
         """Close every bot-owned position; return those still open afterwards.
@@ -666,6 +921,9 @@ class Bot:
                 self._forget_position(position["id"])
                 position = None
             else:
+                # Holding through this candle: ratchet the broker-side stop
+                # (breakeven / trailing) before leaving the position alone.
+                self._manage_exits(market_id, position, candle)
                 return
 
         decision = self.risk.can_enter(self.state.risk, equity, account_risk)
@@ -788,7 +1046,7 @@ class Bot:
             market_id, side, fmt(sizing.size), fmt(entry), fmt(stop), fmt(tp),
             fmt(sizing.risk_amount, 2), fmt(sizing.required_margin, 2), signal.reason,
         )
-        filled = self._place_entry(market_id, side, sizing.size, entry, stop, tp)
+        filled = self._place_entry(market_id, side, sizing.size, entry, stop, tp, leverage=sizing.leverage)
         if filled is not None:
             self.risk.record_entry(self.state.risk)
             self._persist()
@@ -817,7 +1075,7 @@ class Bot:
         if self.state.risk.total_drawdown_halted:
             return True, self.state.risk.total_drawdown_reason
         if self.state.risk.halted:
-            if self.state.risk.day == _utc_day(self._now()):
+            if self.state.risk.day == self._today():
                 return True, None
             # The UTC day rolled over: roll_day below clears the halt so the new
             # day is guarded like any other.
@@ -843,7 +1101,7 @@ class Bot:
         """
         with self._lock:
             halted_today = self.state.risk.total_drawdown_halted or (
-                self.state.risk.halted and self.state.risk.day == _utc_day(self._now())
+                self.state.risk.halted and self.state.risk.day == self._today()
             )
             needs_flatten = bool(self.state.owned_position_ids)
         if halted_today:
@@ -914,7 +1172,7 @@ class Bot:
             except Exception as exc:  # noqa: BLE001 - watchdog must not die
                 log.warning("watchdog check failed: %s", exc)
                 continue
-            day = _utc_day(self._now())
+            day = self._today()
             if fired and announced_day != day:
                 log.warning("watchdog: kill switch active; guarding until the day rolls over")
                 announced_day = day
@@ -1067,6 +1325,12 @@ class Bot:
                     self._persist()
                 return
             except ApiError as exc:
+                if not exc.is_retryable:
+                    log.error(
+                        "%s: non-retryable error on candle %s (%s); dropping it",
+                        market_id, candle.open_time, exc,
+                    )
+                    return
                 if attempt >= len(delays):
                     log.error(
                         "%s: giving up on candle %s after %d attempts: %s",

@@ -16,11 +16,30 @@ same constraints it will trade under.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from ..risk.sizing import PositionSizer
+from ..strategy.indicators import atr as atr_series
 from .costs import CostModel
 from .data import Bar
 from .metrics import Metrics, compute_metrics
+
+
+def _bar_day(open_time_ms: int, tz: str) -> int:
+    """Day bucket for a bar's open time in the given IANA timezone.
+
+    Matches the live bot's day boundary (default ``America/New_York``) so the
+    daily guard trips on the same bars it would guard live. Falls back to UTC
+    when the zone is unavailable.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = timezone.utc
+    moment = datetime.fromtimestamp(open_time_ms / 1000.0, tz=timezone.utc).astimezone(zone)
+    return moment.toordinal()
 
 
 @dataclass
@@ -29,6 +48,17 @@ class BacktestConfig:
     risk_per_trade_pct: float = 1.0
     leverage: float = 2.0
     max_margin_pct: float = 50.0
+    atr_period: int = 14
+    # Exit management, mirroring the live bot (0 disables each). The breakeven
+    # move arms when a bar's extreme reaches breakeven_at_r * R and ratchets
+    # the stop to entry +/- breakeven_plus_r * R; the trailing stop ratchets to
+    # peak -/+ trail_atr_mult * ATR. Both are evaluated on closed bars, after
+    # that bar's exit check, exactly like the live per-candle manager.
+    breakeven_at_r: float = 0.0
+    breakeven_plus_r: float = 0.1
+    trail_atr_mult: float = 0.0
+    # Day boundary for the daily guard; keep in sync with the live bot.
+    day_timezone: str = "America/New_York"
     # Guards (0 disables). Percentages are of the stated basis.
     max_daily_loss_pct: float = 0.0
     max_total_drawdown_pct: float = 0.0
@@ -92,6 +122,11 @@ class Backtester:
         dd_halted = False
         halt_reason = ""
 
+        atr_values = atr_series(
+            [b.high for b in bars], [b.low for b in bars], [b.close for b in bars],
+            self.cfg.atr_period,
+        )
+
         for i in range(1, len(bars)):
             bar = bars[i]
             window = bars[: i + 1]
@@ -105,6 +140,13 @@ class Backtester:
                     trades.append(trade)
                     pnls.append(trade.pnl)
                     position = None
+                else:
+                    # Still open: ratchet the stop from this closed bar, exactly
+                    # like the live per-candle manager. The exit check above
+                    # runs first with the incoming stop, so a bar that spans
+                    # both the old stop and a management trigger conservatively
+                    # fills the stop (no intrabar look-ahead).
+                    self._update_exits(position, bar, atr_values[i])
 
             # 2) Mark equity (realized + unrealized) and record the curve.
             equity = cash + self._unrealized(position, bar.close)
@@ -112,7 +154,7 @@ class Backtester:
             peak_equity = max(peak_equity, equity)
 
             # 3) Day rollover and guards.
-            bar_day = int(bar.open_time // 86_400_000)
+            bar_day = _bar_day(bar.open_time, self.cfg.day_timezone)
             if bar_day != day:
                 day = bar_day
                 day_start_equity = equity
@@ -163,22 +205,70 @@ class Backtester:
         side = "long" if signal.action == "long" else "short"
         entry = self.costs.entry_price(bar.close, side)
         stop = signal.stop_price
-        distance = abs(entry - stop)
-        if distance <= 0:
-            return None
-        risk_amount = equity * self.cfg.risk_per_trade_pct / 100.0
-        size = risk_amount / distance
-        # Cap by the margin budget: margin = notional/leverage <= equity*max_margin%.
-        max_notional = equity * (self.cfg.max_margin_pct / 100.0) * self.cfg.leverage
-        if size * entry > max_notional:
-            size = max_notional / entry
-        if size <= 0:
+        # Size with the same sizer the live bot uses, so fills the live bot
+        # would reject (below min size/notional, off-step, over margin) are
+        # skipped here too instead of flattering the backtest.
+        sizer = PositionSizer(
+            risk_per_trade_pct=self.cfg.risk_per_trade_pct,
+            leverage=self.cfg.leverage,
+            min_notional=float(self.market.get("min_notional") or 0.0),
+            min_size=float(self.market.get("min_size") or 0.0),
+            size_step=float(self.market.get("size_step") or 0.0),
+            max_leverage=self.market.get("max_leverage"),
+            available_balance=equity * (self.cfg.max_margin_pct / 100.0),
+        )
+        sizing = sizer.size(equity=equity, entry=entry, stop=stop)
+        if not sizing.ok:
             return None
         tp = signal.take_profit_price
         return {
             "side": side, "entry": entry, "stop": stop, "tp": tp,
-            "size": size, "entry_time": bar.open_time,
+            "size": sizing.size, "entry_time": bar.open_time,
+            "risk_distance": abs(entry - stop),
+            "stop_source": "initial",  # initial | breakeven | trailing
+            "peak": None,
         }
+
+    def _update_exits(self, position: dict, bar: Bar, atr_now: Optional[float]) -> None:
+        """Ratchet a position's stop from one closed bar (breakeven + trailing).
+
+        Mirrors ``Bot._manage_exits``: the trigger uses the bar's extreme, the
+        stop only ever tightens, and the take profit is left alone.
+        """
+        side = position["side"]
+        is_long = side == "long"
+        risk = position["risk_distance"]
+        if risk <= 0:
+            return
+        entry = position["entry"]
+        extreme = bar.high if is_long else bar.low
+        excursion = (extreme - entry) if is_long else (entry - extreme)
+        desired = position["stop"]
+        source = position["stop_source"]
+        if (
+            self.cfg.breakeven_at_r > 0
+            and source == "initial"
+            and excursion >= self.cfg.breakeven_at_r * risk
+        ):
+            if is_long:
+                desired = entry + self.cfg.breakeven_plus_r * risk
+            else:
+                desired = entry - self.cfg.breakeven_plus_r * risk
+            source = "breakeven"
+        if self.cfg.trail_atr_mult > 0 and atr_now is not None and atr_now > 0:
+            peak = position["peak"]
+            if peak is None:
+                peak = extreme
+            else:
+                peak = max(peak, extreme) if is_long else min(peak, extreme)
+            position["peak"] = peak
+            trail = peak - self.cfg.trail_atr_mult * atr_now if is_long else \
+                peak + self.cfg.trail_atr_mult * atr_now
+            if (is_long and trail > desired) or (not is_long and trail < desired):
+                desired, source = trail, "trailing"
+        if (is_long and desired > position["stop"]) or (not is_long and desired < position["stop"]):
+            position["stop"] = desired
+            position["stop_source"] = source
 
     def _check_exit(self, position: dict, bar: Bar) -> tuple[Optional[float], str]:
         side, stop, tp = position["side"], position["stop"], position["tp"]
@@ -190,7 +280,9 @@ class Backtester:
             hit_tp = tp is not None and bar.low <= tp
         # Conservative: if both levels are inside the bar, assume the stop filled.
         if hit_stop:
-            return self.costs.exit_price(stop, side), "stop"
+            source = position.get("stop_source") or "initial"
+            reason = {"initial": "stop", "breakeven": "breakeven_stop"}.get(source, "trailing_stop")
+            return self.costs.exit_price(stop, side), reason
         if hit_tp:
             return self.costs.exit_price(tp, side), "take_profit"
         return None, ""

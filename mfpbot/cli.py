@@ -163,17 +163,32 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         print("no bars loaded", file=sys.stderr)
         return 2
 
-    costs = CostModel(
-        commission_pct=args.commission_pct,
-        swap_daily_pct=args.swap_daily_pct,
-        slippage_bps=args.slippage_bps,
-        apply_costs=not args.no_costs,
-    )
+    cost_overrides = {}
+    if args.commission_pct is not None:
+        cost_overrides["commission_pct"] = args.commission_pct
+    if args.swap_daily_pct is not None:
+        cost_overrides["swap_daily_pct"] = args.swap_daily_pct
+    if args.slippage_bps is not None:
+        cost_overrides["slippage_bps"] = args.slippage_bps
+    costs = CostModel.for_asset_class(args.asset_class, **cost_overrides)
+    costs.apply_costs = not args.no_costs
+    market = {
+        "market_id": args.market_id,
+        "min_notional": args.min_notional,
+        "min_size": args.min_size,
+        "size_step": args.size_step,
+        "max_leverage": args.max_leverage or None,
+    }
     bt_config = BacktestConfig(
         starting_equity=args.equity,
         risk_per_trade_pct=args.risk_pct,
         leverage=args.leverage,
         max_margin_pct=cfg.max_margin_pct,
+        atr_period=args.atr_period,
+        breakeven_at_r=args.breakeven_at_r,
+        breakeven_plus_r=args.breakeven_plus_r,
+        trail_atr_mult=args.trail_atr_mult,
+        day_timezone=args.day_timezone,
         max_daily_loss_pct=args.max_daily_loss_pct,
         max_total_drawdown_pct=args.max_total_drawdown_pct,
         drawdown_basis=args.drawdown_basis,
@@ -201,7 +216,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print("-" * len(header))
     for name in names:
         factory = lambda n=name: build_strategy(n, **overrides)
-        result = Backtester(factory(), bt_config, market={"market_id": args.market_id}).run(bars)
+        result = Backtester(factory(), bt_config, market=market).run(bars)
         m = result.metrics
         print(f"{name:<20}{m.trades:>7}{m.win_rate:>7.1f}{m.total_return_pct:>9.2f}"
               f"{m.max_drawdown_pct:>8.2f}{m.mar:>7.2f}{m.profit_factor:>7.2f}{m.expectancy:>9.2f}")
@@ -211,7 +226,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         for name in names:
             factory = lambda n=name: build_strategy(n, **overrides)
             wf = walk_forward(factory, bars, bt_config, folds=args.walk_forward,
-                              market={"market_id": args.market_id})
+                              market=market)
             print(f"  {name:<20} profitable_folds={wf.profitable_fraction:.0%} "
                   f"median_ret={wf.median_return_pct:+.2f}% worstDD={wf.worst_drawdown_pct:.2f}%")
             for fold in wf.folds:
@@ -283,9 +298,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--max-total-drawdown-pct", type=float, default=0.0)
     p_bt.add_argument("--drawdown-basis", default="starting", choices=["starting", "peak"])
     p_bt.add_argument("--max-daily-trades", type=int, default=0)
-    p_bt.add_argument("--commission-pct", type=float, default=0.03)
-    p_bt.add_argument("--swap-daily-pct", type=float, default=0.03)
-    p_bt.add_argument("--slippage-bps", type=float, default=1.2)
+    p_bt.add_argument("--asset-class", default="crypto", choices=["crypto", "tradfi", "forex"],
+                      help="Fee/slippage preset: crypto, tradfi (stocks/commodities/indices), forex")
+    p_bt.add_argument("--commission-pct", type=float, default=None,
+                      help="Override the asset-class commission (default: preset)")
+    p_bt.add_argument("--swap-daily-pct", type=float, default=None,
+                      help="Override the asset-class daily swap (default: preset)")
+    p_bt.add_argument("--slippage-bps", type=float, default=None,
+                      help="Override the asset-class slippage cap in bps (default: preset)")
+    p_bt.add_argument("--atr-period", type=int, default=14, help="ATR period for the trailing stop")
+    p_bt.add_argument("--breakeven-at-r", type=float, default=0.0,
+                      help="Move the stop to breakeven at this R multiple (0 disables)")
+    p_bt.add_argument("--breakeven-plus-r", type=float, default=0.1,
+                      help="Breakeven stop offset past entry, in R")
+    p_bt.add_argument("--trail-atr-mult", type=float, default=0.0,
+                      help="ATR trailing-stop multiple (0 disables)")
+    p_bt.add_argument("--day-timezone", default="America/New_York",
+                      help="Day boundary for the daily guard (live default: America/New_York)")
+    p_bt.add_argument("--min-notional", type=float, default=0.0)
+    p_bt.add_argument("--min-size", type=float, default=0.0)
+    p_bt.add_argument("--size-step", type=float, default=0.0)
+    p_bt.add_argument("--max-leverage", type=float, default=0.0,
+                      help="Market leverage cap (0 = no market cap)")
     p_bt.add_argument("--no-costs", action="store_true", help="Ignore fees/slippage/swap (gross)")
     p_bt.add_argument("--walk-forward", type=int, default=0, help="Number of folds (>1 to enable)")
     p_bt.set_defaults(func=cmd_backtest)

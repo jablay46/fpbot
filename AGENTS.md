@@ -79,11 +79,24 @@ risk budget, and places orders with broker-side TP/SL.
   provider-bounded (short or empty results happen). Implemented as
   `MarketDataStream.fetch_history`. `limit 0` skips retained replay.
   Accepted intervals: `1s 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w 1M`.
-* **Fees (published, used by the backtester's cost model):** crypto commission
-  **0.03%** per fill (maker = taker); crypto hourly swap **0.03%/day** divided
-  into 24 hourly charges (both sides pay). Crypto adverse slippage is banded by
-  open interest (e.g. $100M–$500M OI, up to $100k notional: 1.2 bps/side); a
-  size-aware `GET /v1/markets/{id}/quote` returns the projected `slippage_bps`.
+* **Fees (published, used by the backtester's cost model):** per asset class —
+  commission **0.03%** crypto / **0.005%** stocks-commodities-indices /
+  **0.0025%** forex per fill (maker = taker); hourly swap **0.03%/0.015%/
+  0.005% per day** divided into 24 hourly charges (both sides pay). Adverse
+  slippage caps: crypto banded by open interest (e.g. $100M–$500M OI, up to
+  $100k notional: 1.2 bps/side), majors indices/commodities 0.25 bps, forex
+  0.05 bps; a size-aware `GET /v1/markets/{id}/quote` returns the projected
+  `slippage_bps`. `CostModel.for_asset_class` carries the presets; explicit
+  CLI overrides win over them.
+* **Exit management API (verified against the OpenAPI spec):** a `Position`
+  carries **no** stop/target levels — exits are separate working orders linked
+  from the entry (`take_profit_order_id` / `stop_loss_order_id`,
+  `parent_order_id` on the legs, `trigger_price`, `status=working` lists the
+  resting set). Moving a stop is `PUT /v1/positions/{id}/exit-orders` with a
+  **stale-snapshot-guarded batch**: `expected_position_size` + `expected_orders`
+  (`order_id`/`price`/`size`) + `operations` (`modify`/`place`/`cancel`). A
+  `409` means the snapshot moved (refresh once and retry); a `422` means the
+  move itself was rejected (fail safe, keep the old stop).
 * **Challenge rules (1-Step Select):** profit target **9%**, daily loss limit
   **3%**, **static** max drawdown **3%** — all percentages of the *starting
   balance*, never current equity; rules use account equity incl. open P&L. The
@@ -126,14 +139,30 @@ risk budget, and places orders with broker-side TP/SL.
   `build_strategy` filters kwargs by each signature, so a shared name would
   leak between strategies.
 * **Backtesting:** `mfpbot/backtest/` holds the dataset loader, the cost model
-  (crypto 0.03%/fill, 0.03%/day swap, banded slippage), the bar engine with the
-  same guards as the live bot, the metrics, and walk-forward. `mfpbot/archiver.py`
+  (per-asset-class presets via `CostModel.for_asset_class`), the bar engine with
+  the same guards, the same `PositionSizer`, and the same breakeven/trailing
+  manager as the live bot, the metrics, and walk-forward. `mfpbot/archiver.py`
   records live candles to JSONL (the REST API has no history endpoint). The
-  engine assumes the **stop fills first** when a bar spans both stop and target.
-  Never report gross numbers as edge; the default is net of cost.
+  engine assumes the **stop fills first** when a bar spans both stop and target,
+  and arms breakeven/trailing from a bar only *after* that bar's exit check (no
+  intrabar look-ahead). Never report gross numbers as edge; the default is net
+  of cost. The loader refuses multi-symbol/interval datasets (`load_many`
+  merges same-market shards only); the archiver dedups by
+  `(provider, symbol, interval, open_time)`.
 * Risk guards live in `mfpbot/risk/`. Two layers: bot-side daily caps and
   account-side room from the API risk snapshot. `RiskState` also lives in
-  `mfpbot/state.py` alongside the persisted `BotState`.
+  `mfpbot/state.py` alongside the persisted `BotState`. The daily boundary is
+  the firm's (`FP_DAY_TIMEZONE`, default `America/New_York`) via
+  `risk.manager.day_key`; `_utc_day` stays as a UTC compat wrapper.
+* **Exit management:** `_manage_exits` runs on each closed candle while holding
+  an owned position (breakeven at `FP_BREAKEVEN_AT_R`, then ATR trailing at
+  `FP_TRAIL_ATR_MULT`; the stop only tightens, TP untouched). Levels live in
+  `BotState.position_trades` (recorded at adoption from the sent levels and the
+  actual fill; pruned with ownership). `_move_stop` re-reads the working legs,
+  modifies the single stop leg (re-places it if missing, skips if ambiguous),
+  and retries once on 409. Like everything else, no `_lock` across its REST.
+* Orders carry the sizer's clamped leverage (`sizing.leverage`), never the raw
+  config value, so margin math and the broker agree on markets with a lower cap.
 * **Ownership safety:** the bot records the `position_id` returned by each fill
   in `BotState.owned_position_ids` and only ever closes/reverses positions it
   owns. `_prune_owned` drops IDs once a position is gone (TP/SL/manual close).

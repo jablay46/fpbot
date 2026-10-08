@@ -40,6 +40,10 @@ class PendingEntry:
     idempotency_key: str
     sent_at: float
     pre_position_ids: list[str] = field(default_factory=list)
+    # Levels sent with the entry, transferred to PositionTrade on adoption.
+    side: str = ""
+    stop: float = 0.0
+    take_profit: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,6 +56,52 @@ class PendingEntry:
             idempotency_key=str(data.get("idempotency_key") or ""),
             sent_at=float(data.get("sent_at") or 0.0),
             pre_position_ids=[str(p) for p in data.get("pre_position_ids") or []],
+            side=str(data.get("side") or ""),
+            stop=float(data.get("stop") or 0.0),
+            take_profit=float(data.get("take_profit") or 0.0),
+        )
+
+
+@dataclass
+class PositionTrade:
+    """What the bot knows about one position it opened, for exit management.
+
+    The API's ``Position`` carries no stop/target levels, and the exit-order
+    legs live as separate working orders, so the bot persists the levels it
+    sent at entry. ``last_stop`` tracks the current broker-side stop as the
+    breakeven move and the trailing stop ratchet it; ``peak`` tracks the best
+    favorable extreme seen on closed candles for the trailing calculation.
+    """
+
+    position_id: str
+    market_id: str
+    side: str  # "long" or "short"
+    entry: float
+    risk_distance: float  # |entry - initial stop| = 1R, from actual fill
+    take_profit: float
+    last_stop: float
+    breakeven_done: bool = False
+    trailing: bool = False  # True once the trail (not just breakeven) moved the stop
+    peak: Optional[float] = None  # best favorable extreme on closed candles
+    entry_order_id: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PositionTrade":
+        return cls(
+            position_id=str(data["position_id"]),
+            market_id=str(data["market_id"]),
+            side=str(data.get("side") or "long"),
+            entry=float(data.get("entry") or 0.0),
+            risk_distance=float(data.get("risk_distance") or 0.0),
+            take_profit=float(data.get("take_profit") or 0.0),
+            last_stop=float(data.get("last_stop") or 0.0),
+            breakeven_done=bool(data.get("breakeven_done")),
+            trailing=bool(data.get("trailing")),
+            peak=float(data["peak"]) if data.get("peak") is not None else None,
+            entry_order_id=data.get("entry_order_id"),
         )
 
 
@@ -66,6 +116,9 @@ class BotState:
     # (not a single slot) so an unresolved entry in one market cannot be clobbered
     # by a later entry in another market.
     pending_entries: dict[str, PendingEntry] = field(default_factory=dict)
+    # Per-position trade levels for exit management, keyed by position_id.
+    # Dropped together with ownership once the position is confirmed gone.
+    position_trades: dict[str, PositionTrade] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -93,12 +146,22 @@ class BotState:
         if isinstance(raw_pending, dict):
             entry = PendingEntry.from_dict(raw_pending)
             pending.setdefault(entry.client_order_id, entry)
+        trades: dict[str, PositionTrade] = {}
+        raw_trades = data.get("position_trades")
+        if isinstance(raw_trades, dict):
+            for key, value in raw_trades.items():
+                if isinstance(value, dict):
+                    try:
+                        trades[str(key)] = PositionTrade.from_dict(value)
+                    except (KeyError, TypeError, ValueError):
+                        continue
         return cls(
             risk=risk,
             last_processed_open_time=last,
             last_entry_client_order_id=data.get("last_entry_client_order_id"),
             owned_position_ids=[str(p) for p in owned],
             pending_entries=pending,
+            position_trades=trades,
         )
 
 

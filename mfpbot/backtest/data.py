@@ -55,29 +55,54 @@ def _row_to_bar(row: dict) -> "Bar":
     )
 
 
-def _load_jsonl(path: Path) -> list["Bar"]:
-    bars: list["Bar"] = []
+def _row_group(row: dict) -> tuple[str, str, str]:
+    """``(provider, symbol, interval)`` identity of a row ("" when absent)."""
+    return (
+        str(row.get("provider") or ""),
+        str(row.get("symbol") or row.get("coin") or ""),
+        str(row.get("interval") or ""),
+    )
+
+
+def _check_single_group(rows: list[dict], path: str | Path) -> None:
+    """Refuse a dataset that mixes symbols, providers or intervals.
+
+    Merging two assets' bars into one series silently corrupts every indicator
+    and trade the backtester computes; archive and backtest one market file at
+    a time instead.
+    """
+    groups = {_row_group(row) for row in rows}
+    if len(groups) > 1:
+        pretty = ", ".join("|".join(g) or "?" for g in sorted(groups))
+        raise ValueError(f"{path}: bars mix several (provider|symbol|interval) groups: {pretty}")
+
+
+def _load_jsonl(path: Path) -> tuple[list["Bar"], set[tuple[str, str, str]]]:
+    rows: list[dict] = []
     with path.open() as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            bars.append(_row_to_bar(json.loads(line)))
-    return bars
+            rows.append(json.loads(line))
+    _check_single_group(rows, path)
+    return [_row_to_bar(row) for row in rows], {_row_group(row) for row in rows}
 
 
-def _load_csv(path: Path) -> list["Bar"]:
+def _load_csv(path: Path) -> tuple[list["Bar"], set[tuple[str, str, str]]]:
     with path.open(newline="") as fh:
-        return [_row_to_bar(row) for row in csv.DictReader(fh)]
+        rows = list(csv.DictReader(fh))
+    _check_single_group(rows, path)
+    return [_row_to_bar(row) for row in rows], {_row_group(row) for row in rows}
 
 
 def load_bars(path: str | Path) -> list["Bar"]:
     """Load bars from a JSONL or CSV file, sorted by ``open_time``."""
     p = Path(path)
     if p.suffix.lower() == ".csv":
-        bars = _load_csv(p)
+        bars, _ = _load_csv(p)
     elif p.suffix.lower() in (".jsonl", ".ndjson", ".json"):
-        bars = _load_jsonl(p)
+        bars, _ = _load_jsonl(p)
     else:
         raise ValueError(f"unsupported bar file extension: {p.suffix!r}")
     bars.sort(key=lambda b: b.open_time)
@@ -85,10 +110,26 @@ def load_bars(path: str | Path) -> list["Bar"]:
 
 
 def load_many(paths: Iterable[str | Path]) -> list["Bar"]:
-    """Load and merge several files (e.g. contiguous archiver shards), de-duped."""
+    """Load and merge several files (e.g. contiguous archiver shards), de-duped.
+
+    Every file must cover the same (provider, symbol, interval); merging
+    different markets is refused rather than silently mixed.
+    """
     by_time: dict[int, Bar] = {}
+    groups: set[tuple[str, str, str]] = set()
     for path in paths:
-        for bar in load_bars(path):
+        p = Path(path)
+        if p.suffix.lower() == ".csv":
+            bars, file_groups = _load_csv(p)
+        elif p.suffix.lower() in (".jsonl", ".ndjson", ".json"):
+            bars, file_groups = _load_jsonl(p)
+        else:
+            raise ValueError(f"unsupported bar file extension: {p.suffix!r}")
+        groups |= file_groups
+        if len(groups) > 1:
+            pretty = ", ".join("|".join(g) or "?" for g in sorted(groups))
+            raise ValueError(f"bar files mix several (provider|symbol|interval) groups: {pretty}")
+        for bar in bars:
             by_time[bar.open_time] = bar
     return sorted(by_time.values(), key=lambda b: b.open_time)
 

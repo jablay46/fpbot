@@ -261,3 +261,56 @@ def test_can_enter_ignores_loss_but_honours_trade_limit():
     decision = mgr.can_enter(state, equity=100000, account_risk=risk_snapshot())
     assert not decision.allowed
     assert "limit" in decision.reason
+
+
+def test_day_key_follows_the_firm_timezone():
+    from datetime import timezone
+    from mfpbot.risk.manager import day_key
+
+    # 2026-01-02 00:30 UTC is still 2026-01-01 in New York (EST, UTC-5).
+    moment = datetime(2026, 1, 2, 0, 30, tzinfo=timezone.utc)
+    assert day_key(moment, "America/New_York") == "2026-01-01"
+    assert day_key(moment, "UTC") == "2026-01-02"
+
+
+def test_roll_day_uses_the_configured_timezone():
+    from datetime import timezone
+    from mfpbot.risk.manager import RiskState
+
+    state = RiskState(day="2026-01-01", day_start_equity=100000, entries_today=3, halted=True)
+    mgr = _manager(day_tz="America/New_York")
+    # Still Jan 1 in New York: no rollover, halt preserved.
+    mgr.roll_day(state, 99000.0, now=datetime(2026, 1, 2, 0, 30, tzinfo=timezone.utc))
+    assert state.day == "2026-01-01"
+    assert state.halted is True
+    assert state.entries_today == 3
+    # Past midnight ET: the new day clears the halt.
+    mgr.roll_day(state, 99000.0, now=datetime(2026, 1, 2, 5, 1, tzinfo=timezone.utc))
+    assert state.day == "2026-01-02"
+    assert state.halted is False
+    assert state.entries_today == 0
+
+
+def test_bot_only_does_not_warn_on_a_healthy_snapshot(caplog):
+    import logging
+    from mfpbot.risk.manager import RiskState
+
+    mgr = _manager(missing_room_policy="bot-only")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        decision = mgr.can_enter(state, 100000.0, risk_snapshot())
+    assert decision.allowed
+    assert "no room figures" not in caplog.text
+
+
+def test_bot_only_warns_once_when_rooms_are_actually_missing(caplog):
+    import logging
+    from mfpbot.risk.manager import RiskState
+
+    mgr = _manager(missing_room_policy="bot-only")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    snap = risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        assert mgr.can_enter(state, 100000.0, snap).allowed
+        assert mgr.can_enter(state, 100000.0, snap).allowed
+    assert caplog.text.count("no room figures") == 1
