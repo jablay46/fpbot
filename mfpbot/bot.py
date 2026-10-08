@@ -804,11 +804,19 @@ class Bot:
             )
             needs_flatten = bool(self.state.owned_position_ids)
         if halted_today:
-            # Already halted today: no new entries are possible. Keep retrying
-            # the flatten until every bot-owned position is closed, then go
-            # quiet. Ownership is only dropped once a position is confirmed gone
-            # (Q3), so a non-empty set means something is still open, and an
-            # empty one needs no REST at all.
+            # Already halted today: no new entries are possible. A kill can land
+            # while an entry is still unconfirmed, so resolve any pending entry
+            # first — otherwise the position opened by that in-flight order is
+            # stranded until the next candle. Then keep retrying the flatten until
+            # every bot-owned position is closed, then go quiet. Ownership is only
+            # dropped once a position is confirmed gone (Q3), so a non-empty set
+            # means something is still open, and an empty one needs no REST.
+            with self._lock:
+                has_pending = bool(self.state.pending_entries)
+            if has_pending:
+                self._reconcile_pending_entry()
+                with self._lock:
+                    needs_flatten = bool(self.state.owned_position_ids)
             if needs_flatten:
                 self._retry_flatten_while_halted()
             return True

@@ -373,6 +373,64 @@ def test_unconfirmed_entry_in_one_market_blocks_another_market(stub_server, tmp_
     assert bot.state.owned_position_ids == ["pos-1"]
 
 
+def test_halted_watchdog_reconciles_pending_entry(stub_server, tmp_path):
+    """A kill while an entry is unconfirmed must still resolve it (no candle).
+
+    The halted branch of the watchdog has to reconcile the pending entry before
+    deciding whether anything is left to flatten; otherwise the position opened
+    by that in-flight order is stranded until the next candle (up to 15m).
+    """
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99  # the entry cannot be confirmed yet
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert len(state.orders) == 1
+    assert list(bot.state.pending_entries) != []
+    assert bot.state.owned_position_ids == []
+
+    # The kill fires on the next watchdog tick; the lookup also recovers.
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    state.fail_order_lookup_times = 0
+
+    for _ in range(50):
+        bot.check_kill_now()
+        if bot.state.pending_entries == {} and bot.state.owned_position_ids == []:
+            break
+
+    assert bot.state.pending_entries == {}
+    assert bot.state.owned_position_ids == []
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert bot.state.risk.halted
+
+
+def test_halted_watchdog_survives_a_failing_pending_lookup(stub_server, tmp_path):
+    """While the lookup still fails, the watchdog must not crash or re-order."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 1_000_000  # stays unconfirmable
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)
+
+    for _ in range(20):
+        bot.check_kill_now()  # must not raise
+
+    assert len(state.orders) == 1  # never duplicated
+    assert list(bot.state.pending_entries) != []
+    assert bot.state.risk.halted
+
+
 def test_pending_entries_survive_restart(stub_server, tmp_path):
     """Pending entries are persisted and reloaded for reconciliation."""
     now_ms = 1_700_000_000_000 + 1000 * 60_000
