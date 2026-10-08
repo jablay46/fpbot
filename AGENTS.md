@@ -76,6 +76,15 @@ risk budget, and places orders with broker-side TP/SL.
 * A competition account's risk snapshot may report `daily_loss_room` and
   `max_drawdown_room` as `null`; the guards treat `null` as "no limit", so the
   bot-side daily caps are the effective protection there.
+* **Verified on the live $100k challenge account (2026-10-08):** `GET
+  /v1/accounts/{id}` returns `daily_loss_room=null`, `max_drawdown_room=null`,
+  and `requirements.{daily_loss_pct,max_drawdown_pct,profit_target_pct}=0`
+  (the account's `trading-policy` rules all carry `pct: 0`). With the default
+  `FP_ON_MISSING_ROOM=halt`, the bot therefore **refuses every entry** on this
+  account. Trading it requires `FP_ON_MISSING_ROOM=bot-only`, which leaves only
+  the bot-side caps (`FP_MAX_DAILY_LOSS_PCT`, `FP_MAX_DAILY_TRADES`) as
+  protection. `GET /v1/accounts/{id}/trading-policy` is available if the firm
+  later exposes real rule percentages.
 * `save_state` must never raise — a failed write logs and degrades to a direct
   write, because a state-file error must not kill the trading loop.
 * Tests must exercise real code paths. `tests/conftest.py` starts a real
