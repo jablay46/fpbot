@@ -281,7 +281,7 @@ def test_lost_order_response_is_reconciled(stub_server, tmp_path):
     assert len(state.orders) == 1
     assert bot.state.risk.entries_today == 1
     assert bot.state.owned_position_ids == ["pos-1"]
-    assert bot.state.pending_entry is None
+    assert bot.state.pending_entries == {}
 
 
 def test_unknown_order_blocks_entry_without_duplicate(stub_server, tmp_path):
@@ -296,7 +296,7 @@ def test_unknown_order_blocks_entry_without_duplicate(stub_server, tmp_path):
     )
 
     assert len(state.orders) == 1
-    assert bot.state.pending_entry is not None
+    assert bot.state.pending_entries != {}
     assert bot.state.risk.entries_today == 0
     assert bot.state.owned_position_ids == []
 
@@ -319,7 +319,7 @@ def test_pending_entry_is_reconciled_on_later_candle(stub_server, tmp_path):
     _feed_fresh_cross(
         bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
     )
-    assert bot.state.pending_entry is not None
+    assert bot.state.pending_entries != {}
     assert bot.state.risk.entries_today == 0
 
     # The lookup recovers; the next candle reconciles the outstanding entry.
@@ -333,7 +333,60 @@ def test_pending_entry_is_reconciled_on_later_candle(stub_server, tmp_path):
     assert len(state.orders) == 1
     assert bot.state.risk.entries_today == 1
     assert bot.state.owned_position_ids == ["pos-1"]
-    assert bot.state.pending_entry is None
+    assert bot.state.pending_entries == {}
+
+
+def test_unconfirmed_entry_in_one_market_blocks_another_market(stub_server, tmp_path):
+    """An unresolved entry in market A must not be clobbered by an entry in B."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(
+        stub_server, tmp_path, symbols=["binance|BTCUSDT", "binance|ETHUSDT"],
+        clock=lambda: now_ms / 1000.0,
+    )
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99  # BTC order stays unconfirmed
+
+    # Market A sends an entry whose reply and lookup both fail.
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert len(state.orders) == 1
+    pending_btc = list(bot.state.pending_entries)
+
+    # Market B has a fresh signal, but A is unresolved: B must not open.
+    _feed_fresh_cross(
+        bot, "binance|ETHUSDT", scale(UP_CLOSES, QUOTES["binance|ETHUSDT"]), now_ms=now_ms
+    )
+    assert len(state.orders) == 1
+    assert list(bot.state.pending_entries) == pending_btc
+    assert not any(o.get("market_id") == "binance|ETHUSDT" for o in state.orders)
+
+    # Once A's lookup recovers, A is adopted and the block lifts.
+    state.fail_order_lookup_times = 0
+    now2 = now_ms + 60_000
+    bot.clock = lambda: now2 / 1000.0
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now2
+    )
+    assert bot.state.pending_entries == {}
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.owned_position_ids == ["pos-1"]
+
+
+def test_pending_entries_survive_restart(stub_server, tmp_path):
+    """Pending entries are persisted and reloaded for reconciliation."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert len(bot.state.pending_entries) == 1
+
+    reloaded = load_state(str(tmp_path / "state.json"))
+    assert list(reloaded.pending_entries) == list(bot.state.pending_entries)
 
 
 def test_run_offloads_candle_work_to_a_worker_thread(stub_server, tmp_path, monkeypatch):

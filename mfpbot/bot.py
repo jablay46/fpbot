@@ -181,7 +181,7 @@ class Bot:
             sent_at=self.clock(),
             pre_position_ids=self._market_position_ids(market_id),
         )
-        self.state.pending_entry = pending
+        self.state.pending_entries[client_order_id] = pending
         self.state.last_entry_client_order_id = client_order_id
         save_state(self.cfg.state_path, self.state)
 
@@ -204,56 +204,66 @@ class Bot:
                 "%s: cannot confirm order %s (%s); blocking new entries in this market",
                 market_id, pending.client_order_id, lookup_exc,
             )
-            # Keep pending_entry so the next candle / watchdog retries the lookup.
+            # Keep the pending entry so the next candle / watchdog retries the lookup.
             save_state(self.cfg.state_path, self.state)
             return None
         if found is None:
             log.warning("%s: order %s was not accepted; treating as not sent", market_id, pending.client_order_id)
-            self.state.pending_entry = None
+            self._clear_pending(pending.client_order_id)
             save_state(self.cfg.state_path, self.state)
             return None
         log.info("%s: reconciled order %s after a lost reply", market_id, pending.client_order_id)
         return self._finish_entry(market_id, found, pending)
 
+    def _clear_pending(self, client_order_id: str) -> None:
+        self.state.pending_entries.pop(client_order_id, None)
+
     def _finish_entry(
         self, market_id: str, created: dict[str, Any], pending: PendingEntry
     ) -> Optional[dict[str, Any]]:
-        """Await the fill, adopt the position, and clear the pending marker."""
+        """Await the fill, adopt the position, and clear the pending marker.
+
+        Only this entry's own pending marker is cleared, never another market's.
+        """
         filled = self._await_order(market_id, created)
         if filled is not None:
             self._adopt_position(market_id, pending.pre_position_ids)
-        self.state.pending_entry = None
+        self._clear_pending(pending.client_order_id)
         save_state(self.cfg.state_path, self.state)
         return filled
 
     def _reconcile_pending_entry(self) -> bool:
-        """Resolve an outstanding entry from a previous send. Returns True if busy.
+        """Resolve every outstanding entry from a previous send.
 
-        Blocks new entries in that market until the outcome is known so a lost
-        order can never be duplicated.
+        Returns True if any entry is still unresolved. While any pending entry
+        exists (in any market) new entries are blocked, so a lost order can
+        never be duplicated.
         """
-        pending = self.state.pending_entry
-        if pending is None:
-            return False
-        try:
-            found = self.client.find_order_by_client_id(pending.client_order_id)
-        except ApiError as exc:
-            log.warning(
-                "%s: still cannot confirm pending entry %s (%s); skipping new entries",
-                pending.market_id, pending.client_order_id, exc,
-            )
-            return True
-        if found is None:
-            log.info("%s: pending entry %s was never accepted; clearing", pending.market_id, pending.client_order_id)
-            self.state.pending_entry = None
-            save_state(self.cfg.state_path, self.state)
-            return False
-        log.info("%s: resolving pending entry %s", pending.market_id, pending.client_order_id)
-        filled = self._finish_entry(pending.market_id, found, pending)
-        if filled is not None:
-            self.risk.record_entry(self.state.risk)
-            save_state(self.cfg.state_path, self.state)
-        return True
+        busy = False
+        for pending in list(self.state.pending_entries.values()):
+            try:
+                found = self.client.find_order_by_client_id(pending.client_order_id)
+            except ApiError as exc:
+                log.warning(
+                    "%s: still cannot confirm pending entry %s (%s); skipping new entries",
+                    pending.market_id, pending.client_order_id, exc,
+                )
+                busy = True
+                continue
+            if found is None:
+                log.info(
+                    "%s: pending entry %s was never accepted; clearing",
+                    pending.market_id, pending.client_order_id,
+                )
+                self._clear_pending(pending.client_order_id)
+                save_state(self.cfg.state_path, self.state)
+                continue
+            log.info("%s: resolving pending entry %s", pending.market_id, pending.client_order_id)
+            filled = self._finish_entry(pending.market_id, found, pending)
+            if filled is not None:
+                self.risk.record_entry(self.state.risk)
+                save_state(self.cfg.state_path, self.state)
+        return busy
 
     def _market_position_ids(self, market_id: str) -> list[str]:
         """IDs of currently open positions in one market (pre-entry snapshot)."""
@@ -467,8 +477,12 @@ class Bot:
         if signal is None:
             return
 
-        if self.state.pending_entry is not None and self.state.pending_entry.market_id == market_id:
-            log.warning("%s: an unconfirmed entry is still pending; not opening another", market_id)
+        if self.state.pending_entries:
+            ids = ", ".join(sorted(self.state.pending_entries))
+            log.warning(
+                "%s: unconfirmed entry(ies) still pending (%s); not opening new entries",
+                market_id, ids,
+            )
             return
 
         if self._margin_headroom(positions, equity) <= 0:

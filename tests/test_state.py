@@ -56,15 +56,37 @@ def test_owned_position_ids_round_trip(tmp_path):
     assert load_state(path).owned_position_ids == ["pos-1", "pos-2"]
 
 
-def test_pending_entry_round_trip(tmp_path):
+def test_pending_entries_round_trip(tmp_path):
     path = tmp_path / "state.json"
-    pending = PendingEntry(
+    a = PendingEntry(
         market_id="binance|BTCUSDT",
-        client_order_id="mfpbot:x:1",
+        client_order_id="mfpbot:btc:1",
         idempotency_key="key-1",
         sent_at=1.5,
         pre_position_ids=["pos-old"],
     )
-    save_state(path, BotState(pending_entry=pending))
+    b = PendingEntry(
+        market_id="binance|ETHUSDT",
+        client_order_id="mfpbot:eth:2",
+        idempotency_key="key-2",
+        sent_at=2.5,
+    )
+    save_state(path, BotState(pending_entries={a.client_order_id: a, b.client_order_id: b}))
     loaded = load_state(path)
-    assert loaded.pending_entry == pending
+    assert loaded.pending_entries == {a.client_order_id: a, b.client_order_id: b}
+
+
+def test_legacy_single_pending_entry_migrates(tmp_path):
+    """State written before the collection format must still load."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"pending_entry": {"market_id": "binance|BTCUSDT", '
+        '"client_order_id": "mfpbot:btc:1", "idempotency_key": "key-1", '
+        '"sent_at": 1.5, "pre_position_ids": ["pos-old"]}}',
+        encoding="utf-8",
+    )
+    loaded = load_state(path)
+    assert list(loaded.pending_entries) == ["mfpbot:btc:1"]
+    pending = loaded.pending_entries["mfpbot:btc:1"]
+    assert pending.market_id == "binance|BTCUSDT"
+    assert pending.pre_position_ids == ["pos-old"]

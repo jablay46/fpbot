@@ -49,8 +49,10 @@ class BotState:
     last_entry_client_order_id: Optional[str] = None
     # Positions opened by this bot, so it never touches manual positions.
     owned_position_ids: list[str] = field(default_factory=list)
-    # An entry order awaiting confirmation; blocks new entries in its market.
-    pending_entry: Optional[PendingEntry] = None
+    # Entry orders awaiting confirmation, keyed by client_order_id. A collection
+    # (not a single slot) so an unresolved entry in one market cannot be clobbered
+    # by a later entry in another market.
+    pending_entries: dict[str, PendingEntry] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,14 +68,24 @@ class BotState:
             # None or a legacy scalar cursor from the single-market format.
             last = {}
         owned = data.get("owned_position_ids") or []
+        pending: dict[str, PendingEntry] = {}
+        raw_entries = data.get("pending_entries")
+        if isinstance(raw_entries, dict):
+            for key, value in raw_entries.items():
+                if isinstance(value, dict):
+                    entry = PendingEntry.from_dict(value)
+                    pending[str(key)] = entry
+        # Migrate the legacy single-slot format.
         raw_pending = data.get("pending_entry")
-        pending = PendingEntry.from_dict(raw_pending) if isinstance(raw_pending, dict) else None
+        if isinstance(raw_pending, dict):
+            entry = PendingEntry.from_dict(raw_pending)
+            pending.setdefault(entry.client_order_id, entry)
         return cls(
             risk=risk,
             last_processed_open_time=last,
             last_entry_client_order_id=data.get("last_entry_client_order_id"),
             owned_position_ids=[str(p) for p in owned],
-            pending_entry=pending,
+            pending_entries=pending,
         )
 
 
