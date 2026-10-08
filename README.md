@@ -56,8 +56,10 @@ Key settings (see `.env.example` for all of them):
 | `FP_MAX_DAILY_LOSS_PCT`, `FP_MAX_DAILY_TRADES` | Bot-side daily guards |
 | `FP_MIN_DAILY_ROOM_PCT` | Stop/flatten when account loss room falls below this % of starting balance |
 | `FP_MAX_MARGIN_PCT` | Cap total position margin across markets as a percent of equity |
+| `FP_MAX_ENTRY_DRIFT_ATR` | Max quote-vs-close drift to enter, as a multiple of ATR (5% absolute cap on top) |
 | `FP_FLATTEN_SCOPE` | `bot` closes only bot-opened positions; `account` closes all |
-| `FP_DRY_RUN` | Log intended orders without sending them |
+| `FP_ON_MISSING_ROOM` | `halt` (fail closed) or `bot-only` when the risk snapshot has null room; empty = halt on live, bot-only on sandbox |
+| `FP_DRY_RUN` | Log intended orders without sending them (uses a separate `<FP_STATE_FILE>.dryrun` state) |
 
 ## Use
 
@@ -132,10 +134,16 @@ trigger even if the bot is offline.
   budget; size is rounded down to the market's `size_step` and rejected below
   `min_size` / `min_notional`.
 * **Daily guards** — max entries per UTC day and max daily loss measured against
-  the day's starting equity.
+  the day's starting equity. The baseline is the first equity seen that day, not
+  exactly 00:00 UTC; the bot logs a warning when it has to estimate it.
 * **Account guards** — reads the API risk snapshot (`daily_loss_room`,
   `max_drawdown_room`). When room falls below `FP_MIN_DAILY_ROOM_PCT` of the
-  starting balance, the bot flattens positions and halts.
+  starting balance, the bot flattens positions and halts. If the snapshot has
+  no room figures at all, the bot fails closed (`FP_ON_MISSING_ROOM=halt`) unless
+  it is explicitly allowed to keep going on bot-side caps (`bot-only`).
+* **Kill switch runs even while holding a position** — a watchdog polls the
+  account between candles, so the daily loss cap and room floor fire without
+  waiting for the next signal.
 * **Portfolio margin cap** — total position margin across all markets cannot
   exceed `FP_MAX_MARGIN_PCT` of equity; new entries are skipped once it is hit.
 * **Manual positions are safe** — the bot tracks the positions it opened and
@@ -149,9 +157,17 @@ trigger even if the bot is offline.
 
 * The market stream reconnects with exponential backoff and re-subscribes with
   a retained history limit so gaps are backfilled.
-* `429`/`5xx` responses are retried with jittered backoff and `Retry-After`.
+* Replayed history (the candle snapshot sent on every start/reconnect) is never
+  traded: only candles that closed within the last interval are acted on.
+* `429`/`5xx` responses are retried with jittered backoff and `Retry-After`. A
+  transient error while handling a fresh candle is retried, and the candle is
+  only marked processed once it is actually handled.
+* Blocking REST work runs off the WebSocket event loop, so heartbeats and the
+  kill-switch watchdog keep running during order polling.
 * State (daily counters, last processed candle, last entry ID) is persisted to
-  `FP_STATE_FILE` so a restart does not double-count entries.
+  `FP_STATE_FILE` so a restart does not double-count entries. An entry whose
+  reply was lost is recorded before sending and reconciled on startup, on the
+  watchdog tick, or on the next candle.
 
 ## Tests
 
