@@ -54,6 +54,9 @@ Key settings (see `.env.example` for all of them):
 | `FP_TP_RR` | Take profit as a multiple of the stop distance |
 | `FP_LEVERAGE`, `FP_MARGIN_MODE` | Order leverage and `cross`/`isolated` |
 | `FP_MAX_DAILY_LOSS_PCT`, `FP_MAX_DAILY_TRADES` | Bot-side daily guards |
+| `FP_MAX_TOTAL_DRAWDOWN_PCT`, `FP_DRAWDOWN_BASIS` | Cumulative (whole-account) drawdown limit and its basis (`starting` or trailing `peak`); `0` disables |
+| `FP_ACK_NO_DRAWDOWN_GUARD` | Required to run live `bot-only` with no cumulative guard set |
+| `FP_ALLOW_FRESH_STATE` | Allow a live run to start from empty state if the file and its `.bak` are unreadable |
 | `FP_MIN_DAILY_ROOM_PCT` | Stop/flatten when account loss room falls below this % of starting balance |
 | `FP_MAX_MARGIN_PCT` | Cap total position margin across markets as a percent of equity |
 | `FP_MAX_ENTRY_DRIFT_ATR` | Max quote-vs-close drift to enter, as a multiple of ATR (5% absolute cap on top) |
@@ -141,11 +144,20 @@ trigger even if the bot is offline.
   starting balance, the bot flattens positions and halts. If the snapshot has
   no room figures at all, the bot fails closed (`FP_ON_MISSING_ROOM=halt`) unless
   it is explicitly allowed to keep going on bot-side caps (`bot-only`).
+* **Cumulative drawdown guard** — the competition account reports null room
+  figures, so with `FP_ON_MISSING_ROOM=bot-only` nothing beyond the daily cap
+  (which resets every UTC day) would stop a multi-day slide. Set
+  `FP_MAX_TOTAL_DRAWDOWN_PCT` to cap the whole-account drawdown from
+  `FP_DRAWDOWN_BASIS` (`starting`, the default, or the trailing `peak`). It
+  warns at 50% and 80% of the limit and, once breached, sets a sticky halt that
+  survives day rollover and restarts until released with
+  `python -m mfpbot reset-halt --yes`. A live `bot-only` run with no guard must
+  be acknowledged with `FP_ACK_NO_DRAWDOWN_GUARD=true` or it refuses to start.
 * **Kill switch runs even while holding a position** — a watchdog polls the
   account between candles, so the daily loss cap and room floor fire without
   waiting for the next signal. It keeps running for the life of the bot (the
-  halt clears on the next UTC day) and, while halted, retries flattening until
-  every bot-owned position is confirmed closed.
+  halt clears on the next UTC day) and, while halted, reconciles any unconfirmed
+  entry and retries flattening until every bot-owned position is confirmed closed.
 * **Portfolio margin cap** — total position margin across all markets cannot
   exceed `FP_MAX_MARGIN_PCT` of equity; new entries are skipped once it is hit.
 * **Manual positions are safe** — the bot tracks the positions it opened and
@@ -153,7 +165,11 @@ trigger even if the bot is offline.
   `bot` scope; set `FP_FLATTEN_SCOPE=account` to close the whole account.
 * **Account state** — if the account is `failed` or `closed`, the bot stops.
 * **Idempotency** — every create/close uses an `Idempotency-Key`; entries also
-  carry a `client_order_id` for reconciliation after a lost response.
+  carry a `client_order_id` for reconciliation after a lost response. The lookup
+  scans the full order list (paging via the cursor) for the exact id rather than
+  trusting the first row, and retries without the server filter if it is empty,
+  so a misbehaving server can never hide a live in-flight entry and trigger a
+  duplicate.
 
 ## Reliability
 
@@ -168,10 +184,15 @@ trigger even if the bot is offline.
   never held across network I/O. The kill-switch watchdog therefore fires
   promptly even while a candle handler is mid-request, and a kill that lands
   mid-entry stops the order from being sent.
-* State (daily counters, last processed candle, last entry ID) is persisted to
-  `FP_STATE_FILE` so a restart does not double-count entries. An entry whose
-  reply was lost is recorded before sending and reconciled on startup, on the
-  watchdog tick, or on the next candle.
+* State (daily counters, last processed candle, last entry ID, ownership and
+  pending entries) is persisted to `FP_STATE_FILE` so a restart does not
+  double-count entries or drop a position. Saves are serialized under a lock and
+  written via a unique tempfile with `fsync`, keeping a `<state>.bak` copy. An
+  entry whose reply was lost is recorded before sending and reconciled on
+  startup, on the watchdog tick, or on the next candle. If a live, non-dry-run
+  start finds the file and its backup both unreadable, it refuses to start
+  (exit 2) rather than silently trade from empty state, unless
+  `FP_ALLOW_FRESH_STATE=true`.
 
 ## Tests
 
