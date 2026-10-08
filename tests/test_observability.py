@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import logging
 
-from mfpbot.risk.manager import _utc_day
+from mfpbot.risk.manager import day_key
 from tests.conftest import QUOTES, risk_snapshot, make_candles
+
+
+# The bot guards the firm's day boundary (America/New_York by default), so
+# tests pin "today" to the same zone instead of UTC.
+_DAY_TZ = "America/New_York"
+
+
+def _today() -> str:
+    return day_key(tz=_DAY_TZ)
+
 from tests.test_bot import build_bot, scale
 
 
@@ -59,7 +69,7 @@ def test_already_halted_does_not_log_kill_switch_none(stub_server, tmp_path, cap
     bot, state = build_bot(stub_server, tmp_path)
     bot.state.risk.halted = True
     bot.state.risk.halt_reason = "already halted"
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
 
     with caplog.at_level(logging.DEBUG, logger="mfpbot.bot"):

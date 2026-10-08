@@ -19,8 +19,26 @@ from typing import Optional
 log = logging.getLogger("mfpbot.risk")
 
 
+def day_key(now: Optional[datetime] = None, tz: str = "UTC") -> str:
+    """Calendar-day key (``YYYY-MM-DD``) in the given IANA timezone.
+
+    The firm resets the daily loss limit at midnight ``America/New_York``, so
+    the live bot guards that boundary — a UTC day would be 4-5h off around each
+    reset. Falls back to UTC when the zone is unavailable.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = timezone.utc
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(zone).strftime("%Y-%m-%d")
+
+
 def _utc_day(now: Optional[datetime] = None) -> str:
-    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    return day_key(now, "UTC")
 
 
 @dataclass
@@ -69,11 +87,13 @@ class RiskManager:
         missing_room_policy: str = "bot-only",
         max_total_drawdown_pct: float = 0.0,
         drawdown_basis: str = "starting",
+        day_tz: str = "UTC",
     ) -> None:
         self.max_daily_trades = max_daily_trades
         self.max_daily_loss_pct = max_daily_loss_pct
         self.min_daily_room_pct = min_daily_room_pct
         self.starting_balance = starting_balance
+        self.day_tz = day_tz
         # "halt": a null room is treated as a hard stop (fail closed).
         # "bot-only": continue with bot-side caps and warn once per day.
         self.missing_room_policy = missing_room_policy
@@ -135,15 +155,22 @@ class RiskManager:
         carries a usable guard, and :meth:`check_kill` enforces whichever figure is
         present. The operator can opt into bot-only limits to always continue.
         """
+        daily_room = account_risk.get("daily_loss_room")
+        dd_room = account_risk.get("max_drawdown_room")
         if self.missing_room_policy != "halt":
-            if self.missing_room_policy == "bot-only" and state.missing_room_warned_day != state.day:
+            # Only warn when the snapshot is actually missing its room figures;
+            # a healthy snapshot must not cry wolf once a day.
+            if (
+                self.missing_room_policy == "bot-only"
+                and daily_room is None
+                and dd_room is None
+                and state.missing_room_warned_day != state.day
+            ):
                 log.warning(
                     "account risk snapshot has no room figures; relying on bot-side caps only"
                 )
                 state.missing_room_warned_day = state.day
             return True
-        daily_room = account_risk.get("daily_loss_room")
-        dd_room = account_risk.get("max_drawdown_room")
         if daily_room is None and dd_room is None:
             log.error(
                 "account risk snapshot is missing all room figures (daily_loss_room=None, "
@@ -153,7 +180,7 @@ class RiskManager:
         return True
 
     def roll_day(self, state: RiskState, equity: float, now: Optional[datetime] = None) -> RiskState:
-        today = _utc_day(now)
+        today = day_key(now, self.day_tz)
         if state.day != today:
             state.day = today
             state.day_start_equity = equity
@@ -161,10 +188,10 @@ class RiskManager:
             state.halted = False
             state.halt_reason = ""
             log.warning(
-                "new UTC day %s: daily loss baseline set to current equity %s "
-                "(first candle of the day, not 00:00 UTC), so the daily figure is "
-                "approximate",
-                today, equity,
+                "new day %s (%s): daily loss baseline set to current equity %s "
+                "(first observation of the day, not exactly midnight), so the daily "
+                "figure is approximate",
+                today, self.day_tz, equity,
             )
         elif state.day_start_equity is None:
             state.day_start_equity = equity

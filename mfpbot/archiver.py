@@ -28,14 +28,14 @@ log = logging.getLogger("mfpbot.archive")
 class CandleArchiver:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._seen: set[int] = set()
+        self._seen: set[tuple[str, str, str, int]] = set()
         self._fh = None
 
     def _open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
-            for bar in _iter_open_times(self.path):
-                self._seen.add(bar)
+            for key in _iter_bar_keys(self.path):
+                self._seen.add(key)
         self._fh = self.path.open("a")
 
     def close(self) -> None:
@@ -48,8 +48,9 @@ class CandleArchiver:
         if not candle.is_final:
             return False
         if self._fh is None:
-            self._open()  # loads the existing open_times into ``_seen`` first
-        if candle.open_time in self._seen:
+            self._open()  # loads the existing bar keys into ``_seen`` first
+        key = (candle.provider, candle.symbol, candle.interval, candle.open_time)
+        if key in self._seen:
             return False
         self._fh.write(json.dumps({
             "open_time": candle.open_time,
@@ -63,11 +64,12 @@ class CandleArchiver:
             "interval": candle.interval,
         }) + "\n")
         self._fh.flush()
-        self._seen.add(candle.open_time)
+        self._seen.add(key)
         return True
 
 
-def _iter_open_times(path: Path):
+def _iter_bar_keys(path: Path):
+    """Yield ``(provider, symbol, interval, open_time)`` for each valid row."""
     with path.open() as fh:
         for line in fh:
             line = line.strip()
@@ -78,7 +80,12 @@ def _iter_open_times(path: Path):
             except json.JSONDecodeError:
                 continue
             if "open_time" in row:
-                yield int(row["open_time"])
+                yield (
+                    str(row.get("provider") or ""),
+                    str(row.get("symbol") or ""),
+                    str(row.get("interval") or ""),
+                    int(row["open_time"]),
+                )
 
 
 async def run_archive(

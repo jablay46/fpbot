@@ -227,3 +227,25 @@ def test_legacy_single_pending_entry_migrates(tmp_path):
     pending = loaded.pending_entries["mfpbot:btc:1"]
     assert pending.market_id == "binance|BTCUSDT"
     assert pending.pre_position_ids == ["pos-old"]
+
+
+def test_position_trades_round_trip(tmp_path):
+    from mfpbot.state import PositionTrade
+
+    path = tmp_path / "state.json"
+    trade = PositionTrade(
+        position_id="pos-1", market_id="binance|BTCUSDT", side="long",
+        entry=100.0, risk_distance=2.0, take_profit=104.0, last_stop=98.0,
+        breakeven_done=True, trailing=False, peak=101.0, entry_order_id="order-1",
+    )
+    save_state(str(path), BotState(owned_position_ids=["pos-1"], position_trades={"pos-1": trade}))
+    reloaded = load_state(str(path))
+    assert reloaded.position_trades["pos-1"] == trade
+
+
+def test_position_trades_absent_in_legacy_files(tmp_path):
+    import json
+
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"owned_position_ids": ["pos-1"]}), encoding="utf-8")
+    assert load_state(str(path)).position_trades == {}

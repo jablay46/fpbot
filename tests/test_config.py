@@ -247,3 +247,64 @@ def test_symbols_from_config_file_list(tmp_path):
     path.write_text(json.dumps({"symbols": ["binance|BTCUSDT", "binance|ETHUSDT"]}), encoding="utf-8")
     cfg = load_config(env={"FP_API_KEY": "fp_test_abc"}, config_file=str(path), require_key=True)
     assert cfg.market_ids == ["binance|BTCUSDT", "binance|ETHUSDT"]
+
+
+def _rejects(env):
+    import pytest
+
+    with pytest.raises(ConfigError):
+        load_config(env={"FP_API_KEY": "fp_test_abc", **env}, require_key=True)
+
+
+def test_rejects_non_positive_take_profit_and_stop_mult():
+    _rejects({"FP_TP_RR": "0"})
+    _rejects({"FP_TP_RR": "-2"})
+    _rejects({"FP_ATR_STOP_MULT": "0"})
+    _rejects({"FP_ATR_STOP_MULT": "-1"})
+
+
+def test_rejects_negative_room_floor_and_exit_params():
+    _rejects({"FP_MIN_DAILY_ROOM_PCT": "-0.5"})
+    _rejects({"FP_BREAKEVEN_AT_R": "-1"})
+    _rejects({"FP_BREAKEVEN_PLUS_R": "-0.1"})
+    _rejects({"FP_TRAIL_ATR_MULT": "-2"})
+
+
+def test_rejects_unstreamable_timeframe():
+    _rejects({"FP_TIMEFRAME": "15x"})
+    _rejects({"FP_TIMEFRAME": "1M"})  # valid on the API, but not a fixed span
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_TIMEFRAME": "1h"}, require_key=True)
+    assert cfg.timeframe == "1h"
+
+
+def test_rejects_unknown_strategy():
+    _rejects({"FP_STRATEGY": "martingale"})
+
+
+def test_rejects_bad_timezone_and_parses_exit_params():
+    _rejects({"FP_DAY_TIMEZONE": "Mars/Olympus"})
+    cfg = load_config(
+        env={
+            "FP_API_KEY": "fp_test_abc",
+            "FP_DAY_TIMEZONE": "UTC",
+            "FP_BREAKEVEN_AT_R": "1.0",
+            "FP_BREAKEVEN_PLUS_R": "0.2",
+            "FP_TRAIL_ATR_MULT": "3.0",
+        },
+        require_key=True,
+    )
+    assert cfg.day_timezone == "UTC"
+    assert cfg.breakeven_at_r == 1.0
+    assert cfg.breakeven_plus_r == 0.2
+    assert cfg.trail_atr_mult == 3.0
+
+
+def test_rejects_non_numeric_values_with_config_error():
+    _rejects({"FP_MAX_DAILY_TRADES": "6.0"})
+    _rejects({"FP_RISK_PER_PCT": "lots"})
+    _rejects({"FP_LEVERAGE": "high"})
+
+
+def test_api_key_is_not_in_the_config_repr():
+    cfg = load_config(env={"FP_API_KEY": "fp_test_secret"}, require_key=True)
+    assert "fp_test_secret" not in repr(cfg)

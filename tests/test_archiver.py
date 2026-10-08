@@ -71,3 +71,32 @@ def test_config_rejects_a_bad_donchian_period(monkeypatch):
     else:
         raise AssertionError("expected ConfigError")
 
+
+
+def test_archiver_keeps_two_symbols_with_the_same_open_time(tmp_path):
+    from mfpbot.market_stream import Candle
+
+    def candle(symbol, open_time):
+        return Candle(
+            provider="binance", symbol=symbol, interval="15m",
+            open_time=open_time, close_time=open_time + 899_999,
+            open=100, high=101, low=99, close=100, volume=1.0, is_final=True,
+        )
+
+    path = tmp_path / "bars.jsonl"
+    arch = CandleArchiver(path)
+    assert arch.write(candle("BTCUSDT", 1)) is True
+    # Same bar timestamp, different symbol: a different bar, must be kept.
+    assert arch.write(candle("ETHUSDT", 1)) is True
+    assert arch.write(candle("BTCUSDT", 1)) is False  # now a real duplicate
+    arch.close()
+
+    # And the loader refuses to backtest the mixed file as one series.
+    from mfpbot.backtest import load_bars
+
+    try:
+        load_bars(path)
+    except ValueError as exc:
+        assert "mix" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a mixed file")

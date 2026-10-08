@@ -21,6 +21,14 @@ MARKET_STREAM_URL = "wss://api-stream.myfundedperpetuals.com/v1/market-data"
 # Prefix -> environment, used to catch a key pointed at the wrong host early.
 _KEY_ENVIRONMENTS = {"fp_live_": "live", "fp_test_": "sandbox"}
 
+# Candle intervals the market-data stream accepts. "1M" (one month) is valid on
+# the API but deliberately excluded: month lengths vary, so freshness and stale
+# math cannot treat it as a fixed millisecond span.
+_API_INTERVALS = [
+    "1s", "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w",
+]
+
 
 class ConfigError(ValueError):
     """Raised when configuration is missing or inconsistent."""
@@ -32,7 +40,7 @@ def _env_bool(value: str) -> bool:
 
 @dataclass
 class Config:
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     environment: str = "sandbox"
     account_id: str = ""
     market_id: str = "binance|BTCUSDT"
@@ -56,6 +64,14 @@ class Config:
     risk_per_trade_pct: float = 0.5
     atr_stop_mult: float = 2.0
     take_profit_rr: float = 2.0
+    # Breakeven: once a position is this many R in profit (measured on the
+    # closed candle), move its stop to entry + breakeven_plus_r * R. 0 disables.
+    breakeven_at_r: float = 0.0
+    # Offset past entry for the breakeven stop, in R multiples (covers fees).
+    breakeven_plus_r: float = 0.1
+    # ATR trailing stop: on each closed candle, ratchet the stop to
+    # peak - trail_atr_mult * ATR (longs; mirrored for shorts). 0 disables.
+    trail_atr_mult: float = 0.0
     leverage: float = 2.0
     margin_mode: str = "cross"
     max_daily_loss_pct: float = 2.0
@@ -83,6 +99,10 @@ class Config:
 
     poll_seconds: float = 15.0
     log_level: str = "INFO"
+    # Timezone for the daily-guard day boundary. The firm resets the daily loss
+    # limit at midnight America/New_York, so the bot uses the same zone: a UTC
+    # boundary would guard a 4-5h-shifted window around each reset.
+    day_timezone: str = "America/New_York"
     state_file: str = "bot_state.json"
     dry_run: bool = False
     # Allow a live run to start from empty state when the file and its backup
@@ -173,6 +193,39 @@ class Config:
             raise ConfigError("FP_SUPERTREND_MULT must be greater than zero.")
         if self.risk_per_trade_pct <= 0:
             raise ConfigError("FP_RISK_PER_PCT must be greater than zero.")
+        if self.atr_stop_mult <= 0:
+            raise ConfigError("FP_ATR_STOP_MULT must be greater than zero.")
+        if self.take_profit_rr <= 0:
+            raise ConfigError("FP_TP_RR must be greater than zero.")
+        if self.breakeven_at_r < 0:
+            raise ConfigError("FP_BREAKEVEN_AT_R must be >= 0 (0 disables the breakeven move).")
+        if self.breakeven_plus_r < 0:
+            raise ConfigError("FP_BREAKEVEN_PLUS_R must be >= 0.")
+        if self.trail_atr_mult < 0:
+            raise ConfigError("FP_TRAIL_ATR_MULT must be >= 0 (0 disables the trailing stop).")
+        if self.min_daily_room_pct < 0:
+            raise ConfigError("FP_MIN_DAILY_ROOM_PCT must be >= 0.")
+        if self.timeframe not in _API_INTERVALS:
+            raise ConfigError(
+                f"FP_TIMEFRAME {self.timeframe!r} is not a streamable interval. "
+                f"Choose one of {_API_INTERVALS}."
+            )
+        try:
+            from .strategy import STRATEGIES  # lazy: keeps config import-light
+        except ImportError:  # pragma: no cover - defensive
+            STRATEGIES = {}
+        if STRATEGIES and self.strategy not in STRATEGIES:
+            raise ConfigError(
+                f"FP_STRATEGY {self.strategy!r} is unknown. Available: {sorted(STRATEGIES)}."
+            )
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(self.day_timezone)
+        except Exception:
+            raise ConfigError(
+                f"FP_DAY_TIMEZONE {self.day_timezone!r} is not a valid IANA timezone "
+                f"(e.g. 'America/New_York')."
+            ) from None
         if self.leverage <= 0:
             raise ConfigError("FP_LEVERAGE must be greater than zero.")
         if self.margin_mode not in {"cross", "isolated"}:
@@ -237,6 +290,9 @@ _ENV_KEYS = {
     "risk_per_trade_pct": "FP_RISK_PER_PCT",
     "atr_stop_mult": "FP_ATR_STOP_MULT",
     "take_profit_rr": "FP_TP_RR",
+    "breakeven_at_r": "FP_BREAKEVEN_AT_R",
+    "breakeven_plus_r": "FP_BREAKEVEN_PLUS_R",
+    "trail_atr_mult": "FP_TRAIL_ATR_MULT",
     "leverage": "FP_LEVERAGE",
     "margin_mode": "FP_MARGIN_MODE",
     "max_daily_loss_pct": "FP_MAX_DAILY_LOSS_PCT",
@@ -251,6 +307,7 @@ _ENV_KEYS = {
     "on_missing_room": "FP_ON_MISSING_ROOM",
     "poll_seconds": "FP_POLL_SECONDS",
     "log_level": "FP_LOG_LEVEL",
+    "day_timezone": "FP_DAY_TIMEZONE",
     "state_file": "FP_STATE_FILE",
     "dry_run": "FP_DRY_RUN",
     "allow_fresh_state": "FP_ALLOW_FRESH_STATE",
@@ -260,6 +317,9 @@ _FLOAT_FIELDS = {
     "risk_per_trade_pct",
     "atr_stop_mult",
     "take_profit_rr",
+    "breakeven_at_r",
+    "breakeven_plus_r",
+    "trail_atr_mult",
     "leverage",
     "max_daily_loss_pct",
     "min_daily_room_pct",
@@ -286,9 +346,15 @@ def _coerce(name: str, value: Any) -> Any:
             return [str(v).strip() for v in value if str(v).strip()]
         return [part.strip() for part in str(value).split(",") if part.strip()]
     if name in _FLOAT_FIELDS:
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{_ENV_KEYS.get(name, name)} must be a number, got {value!r}.") from None
     if name in _INT_FIELDS:
-        return int(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{_ENV_KEYS.get(name, name)} must be an integer, got {value!r}.") from None
     if name in _BOOL_FIELDS:
         return value if isinstance(value, bool) else _env_bool(str(value))
     return str(value)

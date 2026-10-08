@@ -1,12 +1,13 @@
 """Backtesting and walk-forward validation for the trading strategies."""
 
-from .costs import CostModel
+from .costs import ASSET_CLASS_COSTS, CostModel
 from .data import Bar, load_bars, load_many, save_bars_jsonl
 from .engine import BacktestConfig, Backtester, Result, Trade
 from .metrics import Metrics, compute_metrics
 from .walkforward import Fold, WalkForward, compare, walk_forward
 
 __all__ = [
+    "ASSET_CLASS_COSTS",
     "CostModel",
     "Bar",
     "load_bars",

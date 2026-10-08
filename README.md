@@ -27,16 +27,91 @@ step and stays with you.
 
 ## Install
 
+### Prerequisites
+
+* **Python 3.10+** (3.11+ recommended; developed on 3.13). Check with:
+  `python3 --version`
+* **Git**, for cloning and updating the repo.
+* **pip** (ships with Python) and a terminal. On Debian/Ubuntu you may need
+  `sudo apt install python3-venv git` first.
+* Only two runtime dependencies (`requests`, `websockets`, pinned in
+  `requirements.txt`); tests add `pytest` and `pip-audit`.
+
+### 1. Clone the repo
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt   # or: pip install -e .
+git clone https://github.com/jablay46/fpbot.git
+cd fpbot
 ```
+
+Staying on `main` is fine for running the bot. If you were given a feature
+branch to try, switch after cloning:
+
+```bash
+git checkout <branch-name>
+```
+
+### 2. Create and activate a virtual environment
+
+Using a venv keeps the bot's packages isolated from your system Python:
+
+```bash
+# Linux / macOS
+python3 -m venv .venv && source .venv/bin/activate
+
+# Windows (PowerShell)
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+Your prompt should now show `(.venv)`. Re-activate it in every new terminal
+before running the bot.
+
+### 3. Install the bot
+
+```bash
+# Recommended: runtime + test/dev tools
+pip install -r requirements-dev.txt
+
+# Minimal: runtime only
+pip install -r requirements.txt
+
+# Alternative: install as an editable package (adds the `mfpbot` command)
+pip install -e .
+```
+
+### 4. Verify the install
+
+```bash
+python -m pytest -q        # test suite; expect all green, no key needed
+python -m mfpbot markets --filter BTC   # public call, confirms networking works
+```
+
+### Updating later
+
+```bash
+cd fpbot
+git pull
+pip install -r requirements-dev.txt   # picks up any new pins
+```
+
+> The bot never needs root/`sudo`. If `pip` complains about an
+> "externally managed environment" (Debian/Ubuntu), it means you forgot to
+> activate the venv — do not use `--break-system-packages` to work around it.
 
 ## Configure
 
+1. **Get an API key.** Sign in at
+   [myfundedperpetuals.com](https://myfundedperpetuals.com), open
+   Settings → API Keys, and create a key: a free `fp_test_` sandbox key to
+   start with, a `fp_live_` key only when you are ready for a real challenge
+   account. Each key only works on its own host.
+2. **Copy the template and fill it in:**
+
 ```bash
 cp .env.example .env
-# edit .env and set FP_API_KEY (a fp_test_ key to start) and FP_ACCOUNT_ID
+# edit .env: set FP_API_KEY (a fp_test_ key to start) and FP_ACCOUNT_ID
+chmod 600 .env   # optional but recommended: owner-read-only
 ```
 
 Key settings (see `.env.example` for all of them):
@@ -52,6 +127,9 @@ Key settings (see `.env.example` for all of them):
 | `FP_RISK_PER_PCT` | Percent of equity risked between entry and stop |
 | `FP_ATR_STOP_MULT` | Stop distance as a multiple of ATR |
 | `FP_TP_RR` | Take profit as a multiple of the stop distance |
+| `FP_BREAKEVEN_AT_R`, `FP_BREAKEVEN_PLUS_R` | Move the stop to entry ± offset at this R multiple (`0` disables) |
+| `FP_TRAIL_ATR_MULT` | ATR trailing stop multiple, ratcheted per closed candle (`0` disables) |
+| `FP_DAY_TIMEZONE` | Day boundary for the daily guards (default `America/New_York`, the firm's reset) |
 | `FP_LEVERAGE`, `FP_MARGIN_MODE` | Order leverage and `cross`/`isolated` |
 | `FP_MAX_DAILY_LOSS_PCT`, `FP_MAX_DAILY_TRADES` | Bot-side daily guards |
 | `FP_MAX_TOTAL_DRAWDOWN_PCT`, `FP_DRAWDOWN_BASIS` | Cumulative (whole-account) drawdown limit and its basis (`starting` or trailing `peak`); `0` disables |
@@ -141,6 +219,28 @@ filter, that is what keeps the account drawdown guard (below) from ever firing.
 **Which strategy is better is an empirical question — measure it, do not guess.**
 See the next section.
 
+## Exit management: breakeven and trailing stop
+
+Entries carry a broker-side stop and take profit, but a fixed exit leaves two
+things on the table: winners that reverse into full losers, and runners sold
+at a fixed target. Two opt-in managers ratchet the stop once per closed
+candle (the stop only ever tightens; the take profit stays, so whichever
+level is touched first wins):
+
+* **Breakeven** (`FP_BREAKEVEN_AT_R`, e.g. `1.0`) — when a candle's extreme
+  reaches that R multiple, the stop moves to entry ± `FP_BREAKEVEN_PLUS_R`
+  (default `0.1`, a fee buffer). A trade that runs then reverses scratches
+  near flat instead of printing −1R.
+* **ATR trailing stop** (`FP_TRAIL_ATR_MULT`, e.g. `3.0`) — the stop follows
+  `peak ∓ mult × ATR` behind the rally, locking in profit while giving the
+  trend room to breathe.
+
+Both are modeled bar-by-bar in the backtester (`--breakeven-at-r`,
+`--trail-atr-mult`), so tune them on data, not hope. Under the hood the bot
+re-reads the position's working TP/SL legs and sends a guarded move
+(`PUT /v1/positions/{id}/exit-orders`, retried once on a 409); an ambiguous
+leg set or a rejection fails safe — the old stop stays in force.
+
 ## Backtesting and edge
 
 The REST API has no historical-candle endpoint, but the public WebSocket does
@@ -165,11 +265,14 @@ python -m mfpbot backtest --bars data/btc15m.jsonl \
   --walk-forward 5
 ```
 
-The reported metrics are all **after** costs:
-commission (crypto 0.03%/fill), hourly swap (crypto 0.03%/day) and adverse
-slippage (default 1.2 bps/side), matching
+The reported metrics are all **after** costs, using the fee preset for the
+dataset's asset class (`--asset-class crypto|tradfi|forex`): commission
+(0.03%/0.005%/0.0025% per fill), hourly swap (0.03%/0.015%/0.005% per day)
+and adverse slippage caps (1.2/0.25/0.05 bps/side), matching
 `docs.myfundedperpetuals.com/guides/commissions-and-fees` and
-`/guides/trading-guide`. `--no-costs` shows the gross picture for contrast.
+`/guides/trading-guide`. `--commission-pct` / `--swap-daily-pct` /
+`--slippage-bps` override the preset (e.g. a thinner market's slippage
+band); `--no-costs` shows the gross picture for contrast.
 
 Read the output this way:
 
@@ -180,10 +283,14 @@ Read the output this way:
 * Compare against `ema_cross` as the baseline that a replacement must beat.
 
 The engine (`mfpbot/backtest/engine.py`) applies the same daily-loss,
-cumulative-drawdown and daily-trade guards as the live bot, so a strategy is
-measured under the constraints it will actually trade under. When both the stop
-and the take profit fall inside one bar it assumes the stop filled first
-(conservative).
+cumulative-drawdown and daily-trade guards as the live bot, sizes with the
+same `PositionSizer` (so fills the live bot would reject for min
+size/notional, size step or margin are skipped here too), and models the
+breakeven/trailing manager bar-by-bar — so a strategy is measured under the
+constraints it will actually trade under. When both the stop and the take
+profit fall inside one bar it assumes the stop filled first (conservative).
+Backtest one market file at a time: the loader refuses a dataset that mixes
+symbols, providers or intervals, which would silently corrupt every figure.
 
 ## Two accounts: execution and copy trading
 
@@ -217,9 +324,11 @@ Two cautions, straight from the docs:
 * **Position sizing** — loss between entry and stop is capped at the risk
   budget; size is rounded down to the market's `size_step` and rejected below
   `min_size` / `min_notional`.
-* **Daily guards** — max entries per UTC day and max daily loss measured against
-  the day's starting equity. The baseline is the first equity seen that day, not
-  exactly 00:00 UTC; the bot logs a warning when it has to estimate it.
+* **Daily guards** — max entries per day and max daily loss measured against
+  the day's starting equity, on the firm's day boundary (midnight
+  `America/New_York` via `FP_DAY_TIMEZONE`). The baseline is the first equity
+  seen that day, not exactly midnight; the bot logs a warning when it has to
+  estimate it.
 * **Account guards** — reads the API risk snapshot (`daily_loss_room`,
   `max_drawdown_room`). When room falls below `FP_MIN_DAILY_ROOM_PCT` of the
   starting balance, the bot flattens positions and halts. If the snapshot has
@@ -267,9 +376,9 @@ Two cautions, straight from the docs:
   never held across network I/O. The kill-switch watchdog therefore fires
   promptly even while a candle handler is mid-request, and a kill that lands
   mid-entry stops the order from being sent.
-* State (daily counters, last processed candle, last entry ID, ownership and
-  pending entries) is persisted to `FP_STATE_FILE` so a restart does not
-  double-count entries or drop a position. Saves are serialized under a lock and
+* State (daily counters, last processed candle, last entry ID, ownership,
+  pending entries and per-position trade levels) is persisted to `FP_STATE_FILE`
+  so a restart does not double-count entries or drop a position. Saves are serialized under a lock and
   written via a unique tempfile with `fsync`, keeping a `<state>.bak` copy. An
   entry whose reply was lost is recorded before sending and reconciled on
   startup, on the watchdog tick, or on the next candle. If a live, non-dry-run
@@ -335,6 +444,9 @@ FP_TREND_EMA=200
 FP_RISK_PER_PCT=0.5                # <= 1 keeps a bad day well under any limit
 FP_ATR_STOP_MULT=2.0
 FP_TP_RR=2.0
+FP_BREAKEVEN_AT_R=1.0            # scratch reversals near flat instead of -1R
+FP_BREAKEVEN_PLUS_R=0.1
+FP_TRAIL_ATR_MULT=0              # enable (e.g. 3.0) only after backtesting it
 FP_MAX_DAILY_LOSS_PCT=2.0          # bot-side daily stop (the firm gives none)
 FP_MAX_DAILY_TRADES=6
 FP_MAX_TOTAL_DRAWDOWN_PCT=3        # bot-side, matches the firm's 3% floor

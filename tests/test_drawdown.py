@@ -9,9 +9,19 @@ import pytest
 
 import mfpbot.bot as bot_module
 from mfpbot.cli import main as cli_main
-from mfpbot.risk.manager import RiskState, _utc_day
+from mfpbot.risk.manager import RiskState, day_key
 from mfpbot.state import BotState, load_state, save_state
 from tests.conftest import QUOTES, risk_snapshot, make_candles
+
+
+# The bot guards the firm's day boundary (America/New_York by default), so
+# tests pin "today" to the same zone instead of UTC.
+_DAY_TZ = "America/New_York"
+
+
+def _today() -> str:
+    return day_key(tz=_DAY_TZ)
+
 from tests.test_bot import (
     DOWN_CLOSES,
     UP_CLOSES,
@@ -43,10 +53,10 @@ def test_total_drawdown_halt_survives_day_rollover(stub_server, tmp_path):
     assert bot.state.risk.total_drawdown_halted
     assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
 
-    # The UTC day rolls over; the cumulative halt must NOT clear and no entry
-    # may be taken even on a fresh crossover.
+    # The day rolls over (00:01 ET is 05:01 UTC in January); the cumulative
+    # halt must NOT clear and no entry may be taken even on a fresh crossover.
     bot.state.owned_position_ids = []
-    bot._now = lambda: datetime(2026, 1, 2, 0, 1, tzinfo=timezone.utc)
+    bot._now = lambda: datetime(2026, 1, 2, 5, 1, tzinfo=timezone.utc)
     now2 = now_ms + 60_000
     bot.clock = lambda: now2 / 1000.0
     _feed_fresh_cross(
@@ -78,7 +88,7 @@ def test_total_drawdown_flatten_retried_by_watchdog(stub_server, tmp_path, monke
     monkeypatch.setattr(bot_module, "CLOSE_VERIFY_TIMEOUT", 0.2)
     bot, state = _dd_bot(stub_server, tmp_path, poll_seconds=0.02)
     bot.state.owned_position_ids = _owned_long(state)
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=94000.0)  # triggers the cumulative guard
     state.fail_close_times = 2  # two rejected closes, then it works

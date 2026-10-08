@@ -11,9 +11,19 @@ import mfpbot.bot as bot_module
 from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
-from mfpbot.risk.manager import RiskState, _utc_day
+from mfpbot.risk.manager import RiskState, day_key
 from mfpbot.state import BotState, PendingEntry, load_state, save_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
+
+
+# The bot guards the firm's day boundary (America/New_York by default), so
+# tests pin "today" to the same zone instead of UTC.
+_DAY_TZ = "America/New_York"
+
+
+def _today() -> str:
+    return day_key(tz=_DAY_TZ)
+
 
 
 class _FakeStream:
@@ -396,7 +406,7 @@ def test_halted_watchdog_reconciles_pending_entry(stub_server, tmp_path):
     assert bot.state.owned_position_ids == []
 
     # The kill fires on the next watchdog tick; the lookup also recovers.
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
     state.fail_order_lookup_times = 0
@@ -422,7 +432,7 @@ def test_halted_watchdog_survives_a_failing_pending_lookup(stub_server, tmp_path
     _feed_fresh_cross(
         bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
     )
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=96000.0)
 
@@ -561,7 +571,7 @@ def test_dry_run_uses_a_separate_state_file(stub_server, tmp_path):
     base_url, stub = stub_server
     live = tmp_path / "state.json"
     save_state(str(live), BotState(risk=RiskState(
-        day=_utc_day(), day_start_equity=100000.0, entries_today=5
+        day=_today(), day_start_equity=100000.0, entries_today=5
     )))
 
     cfg = Config(
@@ -687,7 +697,7 @@ def test_kill_switch_runs_while_holding_a_position(stub_server, tmp_path):
         "status": "open", "opened_at": 1,
     }]
     bot.state.owned_position_ids = ["pos-own"]
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
     candle = feed(bot, "binance|BTCUSDT", [100.0] * 12)  # no crossover
@@ -710,7 +720,7 @@ def test_watchdog_flattens_without_a_new_candle(stub_server, tmp_path):
         "status": "open", "opened_at": 1,
     }]
     bot.state.owned_position_ids = ["pos-own"]
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=96000.0)
 
@@ -752,6 +762,8 @@ def test_watchdog_flattens_again_after_the_day_rolls_over(stub_server, tmp_path)
     bot.state.risk.day = "2026-01-01"
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    # Clocks are ET-consistent: the bot guards the America/New_York day, and
+    # January is EST (UTC-5), so 00:01 ET on day 2 is 05:01 UTC.
     clock = {"now": datetime(2026, 1, 1, 23, 59, tzinfo=timezone.utc)}
     bot._now = lambda: clock["now"]
 
@@ -762,22 +774,28 @@ def test_watchdog_flattens_again_after_the_day_rolls_over(stub_server, tmp_path)
             await asyncio.sleep(0.02)
         return False
 
+    def closed(pid):
+        return any(r["path"] == f"/v1/positions/{pid}/close" for r in state.requests)
+
     async def scenario():
         task = asyncio.create_task(bot._watchdog())
         assert await wait_for(lambda: bot.state.risk.halted)
-        assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+        # The halt flag is set before the flatten runs, so wait for the close
+        # request itself instead of asserting it racily.
+        assert await wait_for(lambda: closed("pos-own"))
 
         # Day 2 opens flat at 100k: the watchdog's own roll_day clears the halt.
         state.positions = []
         bot.state.owned_position_ids = []
         state.risk = risk_snapshot(equity=100000.0)
-        clock["now"] = datetime(2026, 1, 2, 0, 1, tzinfo=timezone.utc)
+        clock["now"] = datetime(2026, 1, 2, 5, 1, tzinfo=timezone.utc)
         assert await wait_for(lambda: not bot.state.risk.halted)
 
         # A fresh position and a 3% loss on day 2 must flatten again, no candle.
         bot.state.owned_position_ids = _owned_long(state, position_id="pos-day2")
         state.risk = risk_snapshot(equity=97000.0)
         assert await wait_for(lambda: bot.state.risk.halted)
+        assert await wait_for(lambda: closed("pos-day2"))
         task.cancel()
         try:
             await task
@@ -796,7 +814,7 @@ def test_flatten_retries_until_the_position_is_closed(stub_server, tmp_path, mon
     monkeypatch.setattr(bot_module, "CLOSE_VERIFY_TIMEOUT", 0.2)
     bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
     bot.state.owned_position_ids = _owned_long(state)
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.risk = risk_snapshot(equity=96000.0)  # kill fires
     state.fail_close_times = 2  # two rejected closes, then it works
@@ -847,7 +865,7 @@ def test_watchdog_idles_without_rest_while_halted_and_flat(stub_server, tmp_path
     bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
     bot.state.risk.halted = True
     bot.state.risk.halt_reason = "already halted"
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     baseline = len(state.requests)  # setup traffic (account + markets) is expected
 
@@ -908,7 +926,7 @@ def test_entry_not_sent_after_halt_during_a_slow_entry(stub_server, tmp_path, mo
 
     # Simulate the watchdog halting the bot while the handler is between its
     # signal and the order POST.
-    def halt_then_continue(market_id, side, size, entry, stop, tp):
+    def halt_then_continue(market_id, side, size, entry, stop, tp, leverage=None):
         bot.state.risk.halted = True
         bot.state.risk.halt_reason = "race"
         return bot._place_entry_original(market_id, side, size, entry, stop, tp)
@@ -985,7 +1003,7 @@ def test_kill_check_does_not_wait_for_pending_reconcile(stub_server, tmp_path):
         sent_at=0.0,
         pre_position_ids=[],
     )
-    bot.state.risk.day = _utc_day()
+    bot.state.risk.day = _today()
     bot.state.risk.day_start_equity = 100000.0
     state.slow_paths = {"/v1/orders": 1.0}
     state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
@@ -1078,3 +1096,181 @@ def test_market_id_mapping(stub_server, tmp_path):
     assert bot._market_id_for(candle) == "binance|ETHUSDT"
     unknown = Candle("binance", "DOGEUSDT", "1m", 1, 2, 1, 1, 1, 1, 1, True)
     assert bot._market_id_for(unknown) is None
+
+
+def test_entry_order_leverage_is_clamped_to_the_market_max(stub_server, tmp_path):
+    bot, state = build_bot(stub_server, tmp_path, leverage=50.0)
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    orders = [r for r in state.requests if r["method"] == "POST" and r["path"] == "/v1/orders"]
+    assert len(orders) == 1
+    # The stub market allows 10x; the 50x config must not reach the broker.
+    assert orders[0]["body"]["leverage"] == 10.0
+
+
+def test_adopted_position_records_its_trade_levels(stub_server, tmp_path):
+    bot, state = build_bot(stub_server, tmp_path)
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    trade = bot.state.position_trades.get("pos-1")
+    assert trade is not None
+    assert trade.market_id == "binance|BTCUSDT"
+    assert trade.side == "long"
+    assert trade.entry == pytest.approx(QUOTES["binance|BTCUSDT"])
+    assert trade.risk_distance > 0
+    assert trade.last_stop == pytest.approx(trade.entry - trade.risk_distance)
+    assert trade.take_profit > trade.entry
+    assert trade.entry_order_id == "order-1"
+
+
+def _exit_leg(leg_id, kind, trigger, market_id="binance|BTCUSDT", size=0.01):
+    return {
+        "id": leg_id, "account_id": "acct-1", "market_id": market_id,
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT",
+        "type": kind, "mode": kind, "side": "sell", "size": size,
+        "trigger_price": trigger, "reduce_only": True, "status": "resting",
+    }
+
+
+def _holding_bot(stub_server, tmp_path, **overrides):
+    """A bot holding one owned long (entry 100, stop 98, TP 104) with trade levels."""
+    from mfpbot.state import PositionTrade
+
+    overrides.setdefault("breakeven_at_r", 1.0)
+    bot, state = build_bot(stub_server, tmp_path, **overrides)
+    bot.state.owned_position_ids = _owned_long(state)
+    bot.state.position_trades["pos-own"] = PositionTrade(
+        position_id="pos-own", market_id="binance|BTCUSDT", side="long",
+        entry=100.0, risk_distance=2.0, take_profit=104.0, last_stop=98.0,
+    )
+    state.exit_orders = [
+        _exit_leg("sl-1", "stop_market", 98.0),
+        _exit_leg("tp-1", "take_profit", 104.0),
+    ]
+    bot.state.risk.day = _today()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=100000.0)
+    feed(bot, "binance|BTCUSDT", [100.0] * 12)
+    return bot, state
+
+
+def _holding_candle(high, low=99.0, close=101.0):
+    from mfpbot.market_stream import Candle
+
+    return Candle(
+        provider="binance", symbol="BTCUSDT", interval="1m",
+        open_time=2_000_000_000_000, close_time=2_000_000_059_999,
+        open=100.0, high=high, low=low, close=close, volume=1.0, is_final=True,
+    )
+
+
+def test_breakeven_move_sends_a_guarded_modify(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path)
+
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=103.0))
+
+    puts = [r for r in state.requests if r["method"] == "PUT"]
+    assert len(puts) == 1
+    assert puts[0]["path"] == "/v1/positions/pos-own/exit-orders"
+    body = puts[0]["body"]
+    assert body["expected_position_size"] == pytest.approx(0.01)
+    assert {o["order_id"] for o in body["expected_orders"]} == {"sl-1", "tp-1"}
+    assert body["operations"] == [{"kind": "modify", "order_id": "sl-1", "price": pytest.approx(100.2)}]
+    trade = bot.state.position_trades["pos-own"]
+    assert trade.last_stop == pytest.approx(100.2)
+    assert trade.breakeven_done is True
+
+    # A second candle at the same level must not re-send the same move.
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=103.0))
+    assert len([r for r in state.requests if r["method"] == "PUT"]) == 1
+
+
+def test_no_exit_move_before_the_trigger(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path)
+
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=101.0))
+
+    assert not [r for r in state.requests if r["method"] == "PUT"]
+    assert bot.state.position_trades["pos-own"].last_stop == 98.0
+
+
+def test_trailing_stop_ratchets_behind_the_rally(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path, breakeven_at_r=0.0, trail_atr_mult=1.0)
+    # Append after the 12 flat seed bars (same open_times would replace them).
+    feed(bot, "binance|BTCUSDT", [100.0, 100.0, 102.0, 104.0],
+         start_time=1_700_000_000_000 + 12 * 60_000)
+    candle = bot.series["binance|BTCUSDT"].closed[-1]
+    assert candle.close == 104.0
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    puts = [r for r in state.requests if r["method"] == "PUT"]
+    assert len(puts) == 1
+    price = puts[0]["body"]["operations"][0]["price"]
+    assert 98.0 < price < 105.0  # ratcheted tighter, still below the peak
+    trade = bot.state.position_trades["pos-own"]
+    assert trade.last_stop == pytest.approx(price)
+    assert trade.trailing is True
+    assert trade.peak == pytest.approx(105.0)
+
+
+def test_exit_move_retries_once_on_a_stale_snapshot(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path)
+    state.exit_conflict_times = 1
+
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=103.0))
+
+    puts = [r for r in state.requests if r["method"] == "PUT"]
+    assert len(puts) == 2  # one 409, one success after refresh
+    assert bot.state.position_trades["pos-own"].last_stop == pytest.approx(100.2)
+
+
+def test_exit_move_fails_safe_on_rejection(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path)
+    state.fail_exit_times = 5
+
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=103.0))
+
+    # The old stop stays in force and the state keeps pointing at it.
+    assert bot.state.position_trades["pos-own"].last_stop == 98.0
+    assert bot.state.position_trades["pos-own"].breakeven_done is False
+
+
+def test_ambiguous_stop_legs_are_left_alone(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path)
+    state.exit_orders.append(_exit_leg("sl-2", "stop_market", 97.0))
+
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=103.0))
+
+    assert not [r for r in state.requests if r["method"] == "PUT"]
+    assert bot.state.position_trades["pos-own"].last_stop == 98.0
+
+
+def test_missing_trade_levels_skip_management_without_rest(stub_server, tmp_path):
+    bot, state = _holding_bot(stub_server, tmp_path)
+    del bot.state.position_trades["pos-own"]  # e.g. adopted before the upgrade
+
+    bot.on_closed_candle("binance|BTCUSDT", _holding_candle(high=110.0))
+
+    assert not [r for r in state.requests if r["method"] == "PUT"]
+
+
+def test_non_retryable_candle_errors_are_not_retried(stub_server, tmp_path, monkeypatch):
+    from mfpbot.client import ApiError
+
+    bot, state = build_bot(stub_server, tmp_path)
+    sleeps = []
+    monkeypatch.setattr(bot_module.time, "sleep", lambda s: sleeps.append(s))
+
+    def boom(market_id, candle):
+        raise ApiError("blocked by rule", status=422, code="rule_violation")
+
+    monkeypatch.setattr(bot, "on_closed_candle", boom)
+    bot._handle_fresh_candle("binance|BTCUSDT", make_candles([100.0])[0])
+
+    assert sleeps == []
+    assert bot.state.last_processed_open_time == {}
