@@ -41,6 +41,11 @@ FRESH_CANDLE_RETRY_DELAYS = (2.0, 5.0)
 # How long to wait for a submitted close to actually leave the open book before
 # the flatten attempt is considered to have left the position open.
 CLOSE_VERIFY_TIMEOUT = 5.0
+# Warn (once per hour) when the stream is connected but no fresh candle has been
+# processed for this many intervals: likely a stuck stream or a skewed clock.
+STALE_FRESH_INTERVALS = 3
+# A candle closing this far in the future means the local clock is behind.
+FUTURE_CANDLE_TOLERANCE_S = 60.0
 
 
 class Bot:
@@ -93,6 +98,16 @@ class Bot:
         # Serializes pending-entry reconciliation. Acquired without blocking so
         # the watchdog is never stuck behind a candle handler's REST lookup.
         self._reconcile_lock = threading.Lock()
+        # Wall-clock seconds of the last fresh candle processed, and the last
+        # time the stale-stream warning was emitted (rate-limited to once/hour).
+        self._last_fresh_candle_wall = self.clock()
+        self._stale_warned_wall = 0.0
+        # Per-market startup summary: history candles skipped + newest bar age,
+        # logged once, after the backfill snapshot has been drained.
+        self._snapshot_skipped: dict[str, int] = {}
+        self._snapshot_newest: dict[str, int] = {}
+        self._snapshot_logged: set[str] = set()
+        self._snapshot_active = True
 
     # -- setup ------------------------------------------------------------
 
@@ -586,20 +601,27 @@ class Bot:
                 self._persist()
             raise SystemExit(0)
 
-        # Resolve any entry left unconfirmed by a lost reply before acting.
-        self._reconcile_pending_entry()
-
-        # The account kill switch must run before the position branch: a
-        # bot-owned position must never stop the daily loss / room floor guard
-        # from flattening and halting. The halt flag is set under a short lock
-        # (no REST), so the watchdog's kill path is never blocked by this
-        # handler's network work; the flatten then runs outside the lock.
+        # The account kill switch must run before the position branch and before
+        # reconciling pending entries: a bot-owned position must never stop the
+        # daily loss / room floor guard from flattening and halting, and a kill
+        # must not wait behind an order lookup. The halt flag is set under a
+        # short lock (no REST), so the watchdog's kill path is never blocked by
+        # this handler's network work; the flatten then runs outside the lock.
         with self._lock:
             killed, reason = self._check_kill_locked(account_risk)
         if killed:
-            log.error("kill switch: %s", reason)
-            self._flatten()
+            if reason is None:
+                # Already halted today: the watchdog owns the flatten retry, so
+                # do not treat this as a fresh kill.
+                log.debug("kill switch already active; skipping candle handling")
+                self._retry_flatten_while_halted()
+            else:
+                log.error("kill switch: %s", reason)
+                self._flatten()
             return
+
+        # Resolve any entry left unconfirmed by a lost reply before acting.
+        self._reconcile_pending_entry()
 
         with self._lock:
             equity = self._equity(account_risk)
@@ -852,6 +874,25 @@ class Bot:
         self._reconcile_pending_entry()
         return False
 
+    def _check_stream_health(self) -> None:
+        """Warn when the stream is up but no fresh candle arrives, or the clock lags.
+
+        Rate-limited to one warning per hour so a genuinely idle market does not
+        flood the log. A fresh candle resets the timer.
+        """
+        now = self.clock()
+        stale_after = STALE_FRESH_INTERVALS * self._interval_ms / 1000.0
+        if now - self._last_fresh_candle_wall < stale_after:
+            return
+        if now - self._stale_warned_wall < 3600.0:
+            return
+        self._stale_warned_wall = now
+        log.warning(
+            "stream connected but no fresh candle processed for %.0fs (>%d intervals); "
+            "check for a stuck stream or a system clock offset",
+            now - self._last_fresh_candle_wall, STALE_FRESH_INTERVALS,
+        )
+
     async def _watchdog(self) -> None:
         """Poll the account between candles so guards fire even with no signal.
 
@@ -874,6 +915,10 @@ class Bot:
                 announced_day = day
             elif not fired:
                 announced_day = None
+            try:
+                self._check_stream_health()
+            except Exception as exc:  # noqa: BLE001 - health check must not die
+                log.debug("stream health check failed: %s", exc)
 
     # -- run loop ---------------------------------------------------------
 
@@ -944,17 +989,58 @@ class Bot:
             self.series[market_id].add(candle)
             if not candle.is_final:
                 return
+            now_ms = int(self.clock() * 1000)
+            if candle.close_time > now_ms + FUTURE_CANDLE_TOLERANCE_S * 1000:
+                log.warning(
+                    "%s: candle %s closes %ds in the future; local clock may be behind",
+                    market_id, candle.open_time,
+                    (candle.close_time - now_ms) // 1000,
+                )
+                return
             last = self.state.last_processed_open_time.get(market_id)
             if last is not None and candle.open_time <= last:
                 return
             if not self._is_fresh(candle):
                 self.state.last_processed_open_time[market_id] = candle.open_time
+                self._note_snapshot_candle(market_id, candle)
                 log.debug(
                     "%s: history/backfill candle %s skipped (not fresh)",
                     market_id, candle.open_time,
                 )
                 return
+        self._last_fresh_candle_wall = self.clock()
         self._handle_fresh_candle(market_id, candle)
+
+    def _note_snapshot_candle(self, market_id: str, candle: Candle) -> None:
+        """Record a skipped backfill bar for the once-per-market startup summary."""
+        if not self._snapshot_active:
+            return
+        self._snapshot_skipped[market_id] = self._snapshot_skipped.get(market_id, 0) + 1
+        newest = self._snapshot_newest.get(market_id)
+        if newest is None or candle.close_time > newest:
+            self._snapshot_newest[market_id] = candle.close_time
+        self._maybe_log_snapshot_summary(market_id)
+
+    def _maybe_log_snapshot_summary(self, market_id: str) -> None:
+        """Log one INFO summary per market once its backfill snapshot is drained."""
+        if market_id in self._snapshot_logged:
+            return
+        if market_id not in self.series:
+            return
+        length = len(self.series[market_id]._final)
+        newest = self._snapshot_newest.get(market_id)
+        if newest is None:
+            return
+        interval_ms = self._interval_ms
+        bar_age_s = max(0.0, (self.clock() * 1000.0 - newest) / 1000.0)
+        if bar_age_s > interval_ms / 1000.0 and length < 5:
+            # The snapshot is still streaming in; wait for it to fill out.
+            return
+        self._snapshot_logged.add(market_id)
+        log.info(
+            "%s: snapshot processed: %d history candle(s) skipped, newest bar age %.0fs",
+            market_id, self._snapshot_skipped.get(market_id, 0), bar_age_s,
+        )
 
     def _handle_fresh_candle(self, market_id: str, candle: Candle) -> None:
         """Handle one fresh candle, retrying transient REST errors.
@@ -962,6 +1048,7 @@ class Bot:
         The processed cursor advances only after the candle is handled, so a
         failure leaves it eligible for a retry instead of being silently dropped.
         """
+        self._snapshot_active = False
         delays = list(FRESH_CANDLE_RETRY_DELAYS)
         attempt = 0
         while True:
