@@ -57,6 +57,17 @@ risk budget, and places orders with broker-side TP/SL.
 * The API is in **beta**; breaking changes are possible.
 * REST only covers trading on existing accounts. Signup, purchases, payouts,
   and API-key creation are website-only (and intentionally not automated here).
+* **Verified live (2026-10-08):** `GET /v1/orders?client_order_id=...` filters
+  server-side (a bogus id returns `data: []`), and the returned `Order` echoes
+  the `client_order_id` *only when it was supplied at placement* (orders placed
+  by hand on the website carry `client_order_id: null`). `find_order_by_client_id`
+  therefore verifies the field on the returned order and treats a mismatch as
+  "not found". `close_position` is a blocking POST that returns an ack; execution
+  is asynchronous, so the caller confirms via `_wait_position_gone`.
+* **Verified live (2026-10-08):** the candle WebSocket snapshot arrives with
+  `isFinal: true` for completed history bars and `isFinal: false` for the
+  forming bar (repeated on each update). `Candle.from_event` reads `isFinal`,
+  and `_process_candle` ignores non-final bars.
 
 ## Conventions
 

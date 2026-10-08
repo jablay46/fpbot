@@ -109,6 +109,9 @@ class StubState:
     drop_order_response: bool = False
     # Number of GET /v1/orders responses to answer 503 (lookup also failing).
     fail_order_lookup_times: int = 0
+    # When true, ignore the client_order_id filter and return every order (a
+    # misbehaving/regressed server), to exercise the client-side verification.
+    ignore_order_filter: bool = False
     # Number of extra polls during which a closed position still appears open.
     slow_close_polls: int = 0
     # Number of close requests to reject (422, non-retryable) before accepting.
@@ -277,7 +280,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             rows = list(self.state.orders)
             wanted = query.get("client_order_id", [None])[0]
-            if wanted:
+            if wanted and not self.state.ignore_order_filter:
                 rows = [o for o in rows if o.get("client_order_id") == wanted]
             self._send(200, {"data": rows})
         elif path.startswith("/v1/orders/"):

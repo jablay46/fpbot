@@ -304,9 +304,24 @@ class MfpClient:
         return self._request("GET", "/v1/orders", params=params)
 
     def find_order_by_client_id(self, client_order_id: str, *, account_id: str | None = None) -> dict[str, Any] | None:
+        """Return the order carrying ``client_order_id``, or None if there is none.
+
+        The API filters server-side, but the result is still verified: an
+        order whose ``client_order_id`` does not match is treated as "not found"
+        so a lost-reply reconciliation can never adopt the wrong order.
+        """
         data = self.list_orders(client_order_id=client_order_id, account_id=account_id)
         rows = data if isinstance(data, list) else data.get("data", [])
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        found = rows[0]
+        if found.get("client_order_id") != client_order_id:
+            log.error(
+                "client_order_id lookup %r returned order %s with client_order_id=%r; ignoring",
+                client_order_id, found.get("id"), found.get("client_order_id"),
+            )
+            return None
+        return found
 
     def modify_order(self, order_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return self._request("PATCH", f"/v1/orders/{quote(order_id, safe='')}", body=body)

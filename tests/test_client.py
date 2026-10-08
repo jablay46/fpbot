@@ -72,6 +72,31 @@ def test_error_envelope_is_parsed(client):
     assert err.is_retryable is False
 
 
+def test_find_order_by_client_id_filters_and_verifies(client):
+    c, state = client
+    c.place_order(
+        {"account_id": "acct-1", "market_id": "binance|BTCUSDT", "side": "buy",
+         "size": 0.01, "leverage": 2, "margin_mode": "cross",
+         "client_order_id": "coid-1"},
+    )
+    found = c.find_order_by_client_id("coid-1", account_id="acct-1")
+    assert found is not None and found["client_order_id"] == "coid-1"
+    # A filter that matches nothing returns None, never a stray order.
+    assert c.find_order_by_client_id("coid-missing", account_id="acct-1") is None
+
+
+def test_find_order_by_client_id_rejects_mismatch(client):
+    """If the server ignores the filter, a non-matching order is not adopted."""
+    c, state = client
+    c.place_order(
+        {"account_id": "acct-1", "market_id": "binance|BTCUSDT", "side": "buy",
+         "size": 0.01, "leverage": 2, "margin_mode": "cross",
+         "client_order_id": "coid-1"},
+    )
+    state.ignore_order_filter = True
+    assert c.find_order_by_client_id("coid-other", account_id="acct-1") is None
+
+
 def test_public_client_without_key(stub_server):
     base_url, state = stub_server
     c = MfpClient("", base_url, sleep=lambda _s: None)
