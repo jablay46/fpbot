@@ -225,15 +225,17 @@ Two cautions, straight from the docs:
   starting balance, the bot flattens positions and halts. If the snapshot has
   no room figures at all, the bot fails closed (`FP_ON_MISSING_ROOM=halt`) unless
   it is explicitly allowed to keep going on bot-side caps (`bot-only`).
-* **Cumulative drawdown guard** — the competition account reports null room
+* **Cumulative drawdown guard** — the live challenge account reports null room
   figures, so with `FP_ON_MISSING_ROOM=bot-only` nothing beyond the daily cap
   (which resets every UTC day) would stop a multi-day slide. Set
   `FP_MAX_TOTAL_DRAWDOWN_PCT` to cap the whole-account drawdown from
   `FP_DRAWDOWN_BASIS` (`starting`, the default, or the trailing `peak`). It
   warns at 50% and 80% of the limit and, once breached, sets a sticky halt that
   survives day rollover and restarts until released with
-  `python -m mfpbot reset-halt --yes`. A live `bot-only` run with no guard must
-  be acknowledged with `FP_ACK_NO_DRAWDOWN_GUARD=true` or it refuses to start.
+  `python -m mfpbot reset-halt --yes`. The default is **3**, matching the
+  firm's static 3% Select floor. A live `bot-only` run with no guard
+  (`FP_MAX_TOTAL_DRAWDOWN_PCT=0`) must be acknowledged with
+  `FP_ACK_NO_DRAWDOWN_GUARD=true` or it refuses to start.
 * **Kill switch runs even while holding a position** — a watchdog polls the
   account between candles, so the daily loss cap and room floor fire without
   waiting for the next signal. It keeps running for the life of the bot (the
@@ -314,6 +316,39 @@ The bot can trade a live challenge account, but go in this order:
 Sizing uses the account risk snapshot, so a live challenge account's daily-loss
 and max-drawdown floors are respected. The bot still cannot guarantee profit;
 challenge rules can fail the account on a bad day.
+
+### Recommended setup (the $100k evaluation account)
+
+A live evaluation account reports **null** `daily_loss_room` / `max_drawdown_room`
+and rule percentages of `0`, so the firm's API hands the bot **no daily risk
+limit** to enforce. Run it `bot-only` (default on sandbox; set explicitly on
+live) and let the bot-side guards be the protection. Recommended `.env`:
+
+```bash
+FP_ENV=live
+FP_ACCOUNT_ID=FP-94193894          # the $100k account
+FP_STRATEGY=donchian_breakout      # the default
+FP_TIMEFRAME=15m
+FP_DONCHIAN_PERIOD=20
+FP_REGIME_ADX_MIN=20
+FP_TREND_EMA=200
+FP_RISK_PER_PCT=0.5                # <= 1 keeps a bad day well under any limit
+FP_ATR_STOP_MULT=2.0
+FP_TP_RR=2.0
+FP_MAX_DAILY_LOSS_PCT=2.0          # bot-side daily stop (the firm gives none)
+FP_MAX_DAILY_TRADES=6
+FP_MAX_TOTAL_DRAWDOWN_PCT=3        # bot-side, matches the firm's 3% floor
+FP_ON_MISSING_ROOM=bot-only
+```
+
+Why these numbers: with `FP_RISK_PER_PCT=0.5` a losing trade costs ~0.5% of
+equity, so three bad trades in a day still fit inside the 2% daily cap; the 3%
+cumulative guard stops the bot before the account's own static 3% floor. If you
+ever copy this account to the $2.5K follower, `0.5%` per trade is ~`$12.5` on
+the lead, which keeps a normal losing day near the follower's `$75` daily room.
+**Validate the strategy before trusting it**: see *Backtesting and edge* above;
+record real MFP candles with `python -m mfpbot archive` and require most
+walk-forward folds to be positive.
 
 ### Loading the API key
 

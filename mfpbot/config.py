@@ -38,16 +38,17 @@ class Config:
     market_id: str = "binance|BTCUSDT"
     symbols: list[str] = field(default_factory=list)
 
-    strategy: str = "ema_cross"
+    strategy: str = "donchian_breakout"
     timeframe: str = "15m"
     ema_fast: int = 12
     ema_slow: int = 26
     atr_period: int = 14
     # Donchian breakout: channel lookback, optional ADX regime floor and EMA
-    # trend filter (0 disables each).
+    # trend filter (0 disables each). The defaults enable both filters, which
+    # is what makes this the recommended strategy over a bare EMA cross.
     donchian_period: int = 20
-    regime_adx_min: float = 0.0
-    trend_ema: int = 0
+    regime_adx_min: float = 20.0
+    trend_ema: int = 200
     # Supertrend: ATR period and band multiplier.
     supertrend_period: int = 10
     supertrend_mult: float = 3.0
@@ -61,8 +62,10 @@ class Config:
     max_daily_trades: int = 6
     min_daily_room_pct: float = 0.5
     # Bot-side cumulative drawdown guard, independent of the API's room figures
-    # (which are null on a live challenge account). 0 = disabled.
-    max_total_drawdown_pct: float = 0.0
+    # (which are null on a live challenge account). 0 = disabled. The default
+    # matches the firm's static 3% Select floor, so the bot stops itself before
+    # the account's own limit is ever reached.
+    max_total_drawdown_pct: float = 3.0
     # "starting" measures drawdown from the account starting balance (static);
     # "peak" measures it from the highest equity ever observed (trailing).
     drawdown_basis: str = "starting"
