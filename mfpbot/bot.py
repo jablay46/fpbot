@@ -36,6 +36,9 @@ MAX_ENTRY_DRIFT = 0.05
 FRESHNESS_INTERVALS = 1.5
 # Retry delays (seconds) when a fresh candle hits a transient REST error.
 FRESH_CANDLE_RETRY_DELAYS = (2.0, 5.0)
+# How long to wait for a submitted close to actually leave the open book before
+# the flatten attempt is considered to have left the position open.
+CLOSE_VERIFY_TIMEOUT = 5.0
 
 
 class Bot:
@@ -360,6 +363,13 @@ class Bot:
         return False
 
     def _close_position(self, market_id: str, position: dict[str, Any]) -> bool:
+        """Submit a close. Ownership is kept until the position actually leaves.
+
+        Forgetting the id on submit would strand the position if the close is
+        rejected or never fills: it would look like a foreign position and stop
+        being managed. The id is dropped by ``_prune_owned`` (or ``_flatten``)
+        once the exchange confirms the position is gone.
+        """
         if self.cfg.dry_run:
             log.info("[dry-run] %s: would close position %s", market_id, position["id"])
             return True
@@ -371,38 +381,83 @@ class Bot:
             log.error("%s: failed to close position %s: %s", market_id, position["id"], exc)
             return False
         log.info("%s: close submitted for position %s (%s)", market_id, position["id"], position.get("side"))
-        self._forget_position(position["id"])
         return True
 
-    def _flatten(self) -> None:
+    def _flatten(self) -> list[dict[str, Any]]:
+        """Close every bot-owned position; return those still open afterwards.
+
+        A non-empty return means the account is not flat and the caller must
+        retry (the watchdog does so on every tick while halted).
+        """
         if self.cfg.dry_run:
             log.info("[dry-run] would flatten bot positions for account %s", self.account["id"])
-            return
+            return []
         if self.cfg.flatten_scope == "account":
-            self._flatten_account()
-            return
-        positions = self._owned_positions(self._open_positions())
+            return self._flatten_account()
+        try:
+            positions = self._owned_positions(self._open_positions())
+        except ApiError as exc:
+            log.error("flatten: cannot list positions: %s", exc)
+            return []
         if not positions:
             log.info("flatten: no bot-owned positions to close")
-            return
+            return []
         log.warning("flatten: closing %d bot-owned position(s)", len(positions))
         for position in positions:
-            self._close_position(position.get("market_id"), position)
+            if self._close_position(position.get("market_id"), position):
+                self._wait_position_gone(position["id"], timeout=CLOSE_VERIFY_TIMEOUT)
+        try:
+            self._prune_owned(self._open_positions())
+        except ApiError as exc:
+            log.error("flatten: cannot verify positions after close: %s", exc)
+        return self._owned_positions(self._open_positions())
 
-    def _flatten_account(self) -> None:
+    def _flatten_account(self) -> list[dict[str, Any]]:
         key = self.client.new_idempotency_key()
         for _ in range(20):
             try:
                 result = self.client.close_all_positions(self.account["id"], idempotency_key=key)
             except ApiError as exc:
                 log.error("flatten failed: %s", exc)
-                return
+                return self._open_bot_positions()
             if not isinstance(result, dict) or result.get("status") == "completed":
-                log.info("flatten completed")
-                self.state.owned_position_ids = []
-                return
+                try:
+                    self._prune_owned(self._open_positions())
+                except ApiError as exc:
+                    log.error("flatten: cannot verify positions after close-all: %s", exc)
+                remaining = self._open_bot_positions()
+                if remaining:
+                    log.error("flatten: %d position(s) still open after close-all", len(remaining))
+                else:
+                    log.info("flatten completed")
+                return remaining
             time.sleep(2.0)
         log.warning("flatten did not report completion within retry budget")
+        return self._open_bot_positions()
+
+    def _open_bot_positions(self) -> list[dict[str, Any]]:
+        try:
+            return self._owned_positions(self._open_positions())
+        except ApiError as exc:
+            log.error("flatten: cannot list positions: %s", exc)
+            return []
+
+    def _retry_flatten_while_halted(self) -> None:
+        """Retry flattening bot-owned positions that are still open."""
+        try:
+            positions = self._open_positions()
+        except ApiError as exc:
+            log.error("watchdog: cannot verify open positions while halted: %s", exc)
+            return
+        self._prune_owned(positions)
+        remaining = self._owned_positions(positions)
+        if not remaining:
+            return
+        log.error(
+            "watchdog: %d bot-owned position(s) still open while halted; retrying flatten",
+            len(remaining),
+        )
+        self._flatten()
 
     # -- per-candle logic -------------------------------------------------
 
@@ -465,6 +520,8 @@ class Bot:
                         market_id, position["id"],
                     )
                     return
+                # Confirmed gone: it is safe to stop owning it now.
+                self._forget_position(position["id"])
                 position = None
             else:
                 return
@@ -608,8 +665,19 @@ class Bot:
         would silently leave the account unprotected on the following day.
         """
         with self._lock:
-            if self.state.risk.halted and self.state.risk.day == _utc_day(self._now()):
-                return True
+            if self.state.risk.halted:
+                if self.state.risk.day == _utc_day(self._now()):
+                    # Already halted today: no new entries are possible. Keep
+                    # retrying the flatten until every bot-owned position is
+                    # actually closed, then go quiet. Ownership is only dropped
+                    # once a position is confirmed gone (Q3), so a non-empty set
+                    # is the authoritative signal that something is still open —
+                    # and an empty one means no REST is needed at all.
+                    if self.state.owned_position_ids:
+                        self._retry_flatten_while_halted()
+                    return True
+                # The UTC day rolled over: roll_day below clears the halt so the
+                # new day is guarded like any other.
             self._reconcile_pending_entry()
             account_risk = self._refresh_account()
             equity = self._equity(account_risk)

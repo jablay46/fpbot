@@ -574,7 +574,8 @@ def test_reversal_skips_entry_when_old_position_will_not_close(stub_server, tmp_
 
     assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
     assert not any(r["path"] == "/v1/orders" for r in state.requests)
-    assert bot.state.owned_position_ids == []
+    # The position is still listed, so the bot keeps owning it (no orphan).
+    assert bot.state.owned_position_ids == ["pos-1"]
 
 
 def test_kill_switch_runs_while_holding_a_position(stub_server, tmp_path):
@@ -687,6 +688,57 @@ def test_watchdog_flattens_again_after_the_day_rolls_over(stub_server, tmp_path)
     asyncio.run(scenario())
 
     assert any(r["path"] == "/v1/positions/pos-day2/close" for r in state.requests)
+
+
+def test_flatten_retries_until_the_position_is_closed(stub_server, tmp_path, monkeypatch):
+    """A failed close must be retried by the watchdog, not attempted once."""
+    import asyncio
+
+    monkeypatch.setattr(bot_module, "CLOSE_VERIFY_TIMEOUT", 0.2)
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.owned_position_ids = _owned_long(state)
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # kill fires
+    state.fail_close_times = 2  # two rejected closes, then it works
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        for _ in range(400):
+            if bot.state.owned_position_ids == []:
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    closes = [r for r in state.requests if r["path"] == "/v1/positions/pos-own/close"]
+    assert len(closes) >= 3  # retried after the two failures
+    assert state.closed_position_ids == ["pos-own"]
+    assert bot.state.owned_position_ids == []  # no orphaned id
+
+
+def test_close_keeps_ownership_until_the_position_is_gone(stub_server, tmp_path, monkeypatch):
+    """A close that is accepted but not yet effective must keep the id owned."""
+    monkeypatch.setattr(bot_module, "CLOSE_VERIFY_TIMEOUT", 0.2)
+    bot, state = build_bot(stub_server, tmp_path)
+    bot.state.owned_position_ids = _owned_long(state)
+    state.slow_close_polls = 10_000  # close accepted, position lingers
+
+    remaining = bot._flatten()
+
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+    assert bot.state.owned_position_ids == ["pos-own"]
+    assert [p["id"] for p in remaining] == ["pos-own"]
+
+    # Once the exchange drops it, pruning forgets the id.
+    state.slow_close_polls = 0
+    bot._prune_owned(bot._open_positions())
+    assert bot.state.owned_position_ids == []
 
 
 def test_watchdog_idles_without_rest_while_halted_and_flat(stub_server, tmp_path):

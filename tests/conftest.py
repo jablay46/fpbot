@@ -110,6 +110,8 @@ class StubState:
     fail_order_lookup_times: int = 0
     # Number of extra polls during which a closed position still appears open.
     slow_close_polls: int = 0
+    # Number of close requests to reject (422, non-retryable) before accepting.
+    fail_close_times: int = 0
     # When true, GET /v1/accounts records but drops the response.
     drop_account_response: bool = False
     # Simulated current time in ms for the account risk snapshot.
@@ -279,6 +281,10 @@ class _Handler(BaseHTTPRequestHandler):
                     return
             self._send(404, {"error": {"code": "not_found", "message": "no order"}})
         elif path.startswith("/v1/positions/") and path.endswith("/close"):
+            if self.state.fail_close_times > 0:
+                self.state.fail_close_times -= 1
+                self._send(422, {"error": {"code": "rejected", "message": "close rejected"}})
+                return
             position_id = unquote(path[len("/v1/positions/"): -len("/close")])
             if position_id not in self.state.closed_position_ids:
                 self.state.closed_position_ids.append(position_id)
