@@ -78,6 +78,11 @@ class Config:
         return MARKET_STREAM_URL
 
     @property
+    def state_path(self) -> str:
+        """State file to use; a dry run gets its own so it never touches live state."""
+        return self.state_file + ".dryrun" if self.dry_run else self.state_file
+
+    @property
     def missing_room_policy(self) -> str:
         """Effective policy when the account risk snapshot has null room figures.
 

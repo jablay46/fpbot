@@ -54,6 +54,16 @@ def test_bool_coercion():
     assert cfg.dry_run is True
 
 
+def test_dry_run_state_path_is_separate():
+    live = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_STATE_FILE": "s.json"}, require_key=True)
+    dry = load_config(
+        env={"FP_API_KEY": "fp_test_abc", "FP_STATE_FILE": "s.json", "FP_DRY_RUN": "true"},
+        require_key=True,
+    )
+    assert live.state_path == "s.json"
+    assert dry.state_path == "s.json.dryrun"
+
+
 def test_on_missing_room_defaults_to_bot_only_in_sandbox():
     cfg = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_ENV": "sandbox"}, require_key=True)
     assert cfg.missing_room_policy == "bot-only"

@@ -11,8 +11,8 @@ import mfpbot.bot as bot_module
 from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
-from mfpbot.risk.manager import _utc_day
-from mfpbot.state import BotState, PendingEntry, load_state
+from mfpbot.risk.manager import RiskState, _utc_day
+from mfpbot.state import BotState, PendingEntry, load_state, save_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
 
 
@@ -367,6 +367,38 @@ def test_run_offloads_candle_work_to_a_worker_thread(stub_server, tmp_path, monk
     assert "thread" in seen
     assert seen["thread"] is not threading.current_thread()
     assert len(state.orders) == 1  # the trade still happened
+
+
+def test_dry_run_uses_a_separate_state_file(stub_server, tmp_path):
+    """A dry run must neither read nor write the live state file."""
+    base_url, stub = stub_server
+    live = tmp_path / "state.json"
+    save_state(str(live), BotState(risk=RiskState(
+        day=_utc_day(), day_start_equity=100000.0, entries_today=5
+    )))
+
+    cfg = Config(
+        api_key="fp_test_abc", environment="sandbox", account_id="acct-1",
+        symbols=["binance|BTCUSDT"], strategy="ema_cross", timeframe="1m",
+        ema_fast=2, ema_slow=4, atr_period=2, atr_stop_mult=2.0, take_profit_rr=2.0,
+        risk_per_trade_pct=1.0, leverage=2.0, margin_mode="cross", max_daily_trades=6,
+        max_daily_loss_pct=2.0, min_daily_room_pct=0.5,
+        state_file=str(live), dry_run=True,
+    )
+    cfg.validate()
+    client = MfpClient(cfg.api_key, base_url, sleep=lambda _s: None)
+    bot = Bot(cfg, client=client)  # no injected state -> loads from disk
+    bot.account = client.get_account("acct-1")
+    bot.resolve_markets()
+    bot.risk = bot._build_risk_manager()
+
+    assert bot.state.risk.entries_today == 0  # did not read the live file
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert (tmp_path / "state.json.dryrun").exists()
+    assert load_state(str(live)).risk.entries_today == 5  # live file untouched
 
 
 def test_transient_candle_error_is_retried_without_reordering(stub_server, tmp_path, monkeypatch):

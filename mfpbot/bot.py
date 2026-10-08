@@ -47,7 +47,7 @@ class Bot:
     ) -> None:
         self.cfg = config
         self.client = client or MfpClient(config.api_key, config.base_url)
-        self.state = state or load_state(config.state_file)
+        self.state = state or load_state(config.state_path)
         self.strategy = build_strategy(
             config.strategy,
             fast=config.ema_fast,
@@ -180,7 +180,7 @@ class Bot:
         )
         self.state.pending_entry = pending
         self.state.last_entry_client_order_id = client_order_id
-        save_state(self.cfg.state_file, self.state)
+        save_state(self.cfg.state_path, self.state)
 
         try:
             created = self.client.place_order(order, idempotency_key=idempotency_key)
@@ -202,12 +202,12 @@ class Bot:
                 market_id, pending.client_order_id, lookup_exc,
             )
             # Keep pending_entry so the next candle / watchdog retries the lookup.
-            save_state(self.cfg.state_file, self.state)
+            save_state(self.cfg.state_path, self.state)
             return None
         if found is None:
             log.warning("%s: order %s was not accepted; treating as not sent", market_id, pending.client_order_id)
             self.state.pending_entry = None
-            save_state(self.cfg.state_file, self.state)
+            save_state(self.cfg.state_path, self.state)
             return None
         log.info("%s: reconciled order %s after a lost reply", market_id, pending.client_order_id)
         return self._finish_entry(market_id, found, pending)
@@ -220,7 +220,7 @@ class Bot:
         if filled is not None:
             self._adopt_position(market_id, pending.pre_position_ids)
         self.state.pending_entry = None
-        save_state(self.cfg.state_file, self.state)
+        save_state(self.cfg.state_path, self.state)
         return filled
 
     def _reconcile_pending_entry(self) -> bool:
@@ -243,13 +243,13 @@ class Bot:
         if found is None:
             log.info("%s: pending entry %s was never accepted; clearing", pending.market_id, pending.client_order_id)
             self.state.pending_entry = None
-            save_state(self.cfg.state_file, self.state)
+            save_state(self.cfg.state_path, self.state)
             return False
         log.info("%s: resolving pending entry %s", pending.market_id, pending.client_order_id)
         filled = self._finish_entry(pending.market_id, found, pending)
         if filled is not None:
             self.risk.record_entry(self.state.risk)
-            save_state(self.cfg.state_file, self.state)
+            save_state(self.cfg.state_path, self.state)
         return True
 
     def _market_position_ids(self, market_id: str) -> list[str]:
@@ -287,7 +287,7 @@ class Bot:
                 ):
                     self._remember_position(pos["id"])
                     log.info("%s: adopted position %s (%s)", market_id, pos["id"], pos.get("side"))
-                    save_state(self.cfg.state_file, self.state)
+                    save_state(self.cfg.state_path, self.state)
                     return
             time.sleep(delay)
             delay = min(delay * 1.5, 2.0)
@@ -400,7 +400,7 @@ class Bot:
             log.error("account %s is %s; stopping trading", self.account["id"], status)
             self.state.risk.halted = True
             self.state.risk.halt_reason = f"account {status}"
-            save_state(self.cfg.state_file, self.state)
+            save_state(self.cfg.state_path, self.state)
             raise SystemExit(0)
 
         equity = self._equity(account_risk)
@@ -415,7 +415,7 @@ class Bot:
             if kill.flatten:
                 self._flatten()
                 self.risk.halt(self.state.risk, kill.reason)
-                save_state(self.cfg.state_file, self.state)
+                save_state(self.cfg.state_path, self.state)
             return
 
         # Resolve any entry left unconfirmed by a lost reply before acting.
@@ -569,7 +569,7 @@ class Bot:
         filled = self._place_entry(market_id, side, sizing.size, entry, stop, tp)
         if filled is not None:
             self.risk.record_entry(self.state.risk)
-            save_state(self.cfg.state_file, self.state)
+            save_state(self.cfg.state_path, self.state)
 
     # -- kill-switch watchdog ---------------------------------------------
 
@@ -593,7 +593,7 @@ class Bot:
             if kill.flatten:
                 self._flatten()
                 self.risk.halt(self.state.risk, kill.reason)
-                save_state(self.cfg.state_file, self.state)
+                save_state(self.cfg.state_path, self.state)
             return True
 
     async def _watchdog(self) -> None:
@@ -700,7 +700,7 @@ class Bot:
                     self.on_closed_candle(market_id, candle)
                     self.state.last_processed_open_time[market_id] = candle.open_time
                     self._rotation += 1
-                    save_state(self.cfg.state_file, self.state)
+                    save_state(self.cfg.state_path, self.state)
                 return
             except ApiError as exc:
                 if attempt >= len(delays):
