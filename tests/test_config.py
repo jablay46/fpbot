@@ -54,6 +54,42 @@ def test_bool_coercion():
     assert cfg.dry_run is True
 
 
+def test_dry_run_state_path_is_separate():
+    live = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_STATE_FILE": "s.json"}, require_key=True)
+    dry = load_config(
+        env={"FP_API_KEY": "fp_test_abc", "FP_STATE_FILE": "s.json", "FP_DRY_RUN": "true"},
+        require_key=True,
+    )
+    assert live.state_path == "s.json"
+    assert dry.state_path == "s.json.dryrun"
+
+
+def test_on_missing_room_defaults_to_bot_only_in_sandbox():
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc", "FP_ENV": "sandbox"}, require_key=True)
+    assert cfg.missing_room_policy == "bot-only"
+
+
+def test_on_missing_room_defaults_to_halt_in_live():
+    cfg = load_config(env={"FP_API_KEY": "fp_live_abc", "FP_ENV": "live"}, require_key=True)
+    assert cfg.missing_room_policy == "halt"
+
+
+def test_on_missing_room_explicit_override():
+    cfg = load_config(
+        env={"FP_API_KEY": "fp_test_abc", "FP_ENV": "sandbox", "FP_ON_MISSING_ROOM": "halt"},
+        require_key=True,
+    )
+    assert cfg.missing_room_policy == "halt"
+
+
+def test_on_missing_room_invalid_rejected():
+    with pytest.raises(ConfigError):
+        load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_ON_MISSING_ROOM": "whatever"},
+            require_key=True,
+        )
+
+
 def test_config_file_and_env_precedence(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"risk_per_trade_pct": 2.0, "ema_fast": 3}), encoding="utf-8")
@@ -99,6 +135,92 @@ def test_too_many_symbols_rejected():
     symbols = ",".join(f"binance|SYM{i}USDT" for i in range(33))
     with pytest.raises(ConfigError):
         load_config(env={"FP_API_KEY": "fp_test_abc", "FP_SYMBOLS": symbols}, require_key=True)
+
+
+def test_max_total_drawdown_pct_range():
+    cfg = load_config(
+        env={"FP_API_KEY": "fp_test_abc", "FP_MAX_TOTAL_DRAWDOWN_PCT": "10"},
+        require_key=True,
+    )
+    assert cfg.max_total_drawdown_pct == 10.0
+    with pytest.raises(ConfigError):
+        load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_MAX_TOTAL_DRAWDOWN_PCT": "-1"},
+            require_key=True,
+        )
+    with pytest.raises(ConfigError):
+        load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_MAX_TOTAL_DRAWDOWN_PCT": "100"},
+            require_key=True,
+        )
+
+
+def test_drawdown_basis_validated():
+    cfg = load_config(
+        env={"FP_API_KEY": "fp_test_abc", "FP_DRAWDOWN_BASIS": "peak"}, require_key=True
+    )
+    assert cfg.drawdown_basis == "peak"
+    with pytest.raises(ConfigError):
+        load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_DRAWDOWN_BASIS": "whatever"},
+            require_key=True,
+        )
+
+
+def test_live_bot_only_without_drawdown_guard_refuses_start():
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(
+            env={
+                "FP_API_KEY": "fp_live_abc", "FP_ENV": "live",
+                "FP_ON_MISSING_ROOM": "bot-only",
+            },
+            require_key=True,
+        )
+    assert "drawdown" in str(excinfo.value).lower()
+
+
+def test_live_bot_only_with_drawdown_guard_accepted():
+    cfg = load_config(
+        env={
+            "FP_API_KEY": "fp_live_abc", "FP_ENV": "live",
+            "FP_ON_MISSING_ROOM": "bot-only", "FP_MAX_TOTAL_DRAWDOWN_PCT": "10",
+        },
+        require_key=True,
+    )
+    assert cfg.max_total_drawdown_pct == 10.0
+
+
+def test_live_bot_only_with_ack_accepted():
+    cfg = load_config(
+        env={
+            "FP_API_KEY": "fp_live_abc", "FP_ENV": "live",
+            "FP_ON_MISSING_ROOM": "bot-only", "FP_ACK_NO_DRAWDOWN_GUARD": "true",
+        },
+        require_key=True,
+    )
+    assert cfg.ack_no_drawdown_guard is True
+
+
+def test_live_dry_run_bot_only_without_guard_warns_not_raises():
+    cfg = load_config(
+        env={
+            "FP_API_KEY": "fp_live_abc", "FP_ENV": "live",
+            "FP_ON_MISSING_ROOM": "bot-only", "FP_DRY_RUN": "true",
+        },
+        require_key=True,
+    )
+    assert cfg.missing_room_policy == "bot-only"
+
+
+def test_sandbox_bot_only_without_guard_only_warns(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="mfpbot.config"):
+        cfg = load_config(
+            env={"FP_API_KEY": "fp_test_abc", "FP_ENV": "sandbox", "FP_ON_MISSING_ROOM": "bot-only"},
+            require_key=True,
+        )
+    assert cfg.missing_room_policy == "bot-only"
 
 
 def test_symbols_from_config_file_list(tmp_path):

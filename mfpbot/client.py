@@ -303,10 +303,57 @@ class MfpClient:
             params["cursor"] = cursor
         return self._request("GET", "/v1/orders", params=params)
 
+    # Cap on pages walked when scanning orders without a trusted server filter.
+    MAX_ORDER_SCAN_PAGES = 20
+
+    @staticmethod
+    def _unwrap_orders(data: Any) -> tuple[list[dict[str, Any]], str | None]:
+        """Return ``(rows, next_cursor)`` from a list- or cursor-shaped reply."""
+        if isinstance(data, dict):
+            rows = data.get("items") or data.get("data") or []
+            cursor = data.get("next_cursor") or data.get("next")
+        elif isinstance(data, list):
+            rows, cursor = data, None
+        else:
+            rows, cursor = [], None
+        return rows, cursor
+
+    def _scan_orders(
+        self, client_order_id: str, *, account_id: str | None, use_filter: bool
+    ) -> dict[str, Any] | None:
+        """Page through orders looking for an exact ``client_order_id`` match."""
+        cursor: str | None = None
+        for _ in range(self.MAX_ORDER_SCAN_PAGES):
+            data = self.list_orders(
+                account_id=account_id,
+                client_order_id=client_order_id if use_filter else None,
+                cursor=cursor,
+            )
+            rows, next_cursor = self._unwrap_orders(data)
+            for row in rows:
+                if row.get("client_order_id") == client_order_id:
+                    return row
+            if not next_cursor:
+                return None
+            cursor = next_cursor
+        log.error("client_order_id lookup %r exceeded the page budget", client_order_id)
+        return None
+
     def find_order_by_client_id(self, client_order_id: str, *, account_id: str | None = None) -> dict[str, Any] | None:
-        data = self.list_orders(client_order_id=client_order_id, account_id=account_id)
-        rows = data if isinstance(data, list) else data.get("data", [])
-        return rows[0] if rows else None
+        """Return the order carrying ``client_order_id``, or None if there is none.
+
+        The API filters server-side, but that filter cannot be trusted: a server
+        that ignores it would hide our order behind an unrelated first row and
+        make a live, in-flight entry look like "never accepted" — which the bot
+        would then re-place as a duplicate. So the *whole* returned list is
+        scanned for the exact id, paging with the cursor when the reply is
+        paginated. If the filtered lookup yields nothing, a second scan drops the
+        filter entirely.
+        """
+        found = self._scan_orders(client_order_id, account_id=account_id, use_filter=True)
+        if found is not None:
+            return found
+        return self._scan_orders(client_order_id, account_id=account_id, use_filter=False)
 
     def modify_order(self, order_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return self._request("PATCH", f"/v1/orders/{quote(order_id, safe='')}", body=body)

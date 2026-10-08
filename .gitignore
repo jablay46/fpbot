@@ -4,6 +4,8 @@
 config.yaml
 bot_state.json
 .mfpbot_state.json
+# Dry-run state (<FP_STATE_FILE>.dryrun) is local too.
+*.dryrun
 *.log
 
 # Python

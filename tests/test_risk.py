@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from mfpbot.risk.manager import RiskManager, RiskState
@@ -47,8 +48,130 @@ def test_sizing_caps_leverage_at_market_max():
     assert result.leverage == 5.0
 
 
-def _manager() -> RiskManager:
-    return RiskManager(max_daily_trades=2, max_daily_loss_pct=2.0, min_daily_room_pct=0.5, starting_balance=100000)
+def _manager(**overrides) -> RiskManager:
+    kwargs = dict(
+        max_daily_trades=2,
+        max_daily_loss_pct=2.0,
+        min_daily_room_pct=0.5,
+        starting_balance=100000,
+        max_total_drawdown_pct=0.0,
+        drawdown_basis="starting",
+    )
+    kwargs.update(overrides)
+    return RiskManager(**kwargs)
+
+
+def test_total_drawdown_disabled_when_zero():
+    mgr = _manager(max_total_drawdown_pct=0.0)
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_total_drawdown(state, equity=50000)
+    assert decision.allowed
+
+
+def test_total_drawdown_triggers_on_starting_basis():
+    mgr = _manager(max_total_drawdown_pct=5.0, drawdown_basis="starting")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_total_drawdown(state, equity=94000)  # -6%
+    assert not decision.allowed
+    assert decision.flatten
+
+
+def test_total_drawdown_peak_basis_triggers_on_drop_from_peak():
+    mgr = _manager(max_total_drawdown_pct=5.0, drawdown_basis="peak")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    mgr.check_total_drawdown(state, equity=120000)  # new peak
+    decision = mgr.check_total_drawdown(state, equity=110000)  # -8.3% from peak
+    assert state.peak_equity == 120000
+    assert not decision.allowed
+    assert decision.flatten
+
+
+def test_total_drawdown_starting_basis_ignores_drop_from_peak():
+    """A drop from a high-water mark is not a drawdown from the start balance."""
+    mgr = _manager(max_total_drawdown_pct=5.0, drawdown_basis="starting")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    mgr.check_total_drawdown(state, equity=120000)
+    decision = mgr.check_total_drawdown(state, equity=110000)  # still above start
+    assert decision.allowed
+
+
+def test_peak_equity_tracks_observations():
+    mgr = _manager(max_total_drawdown_pct=0.0)
+    state = RiskState()
+    mgr.check_total_drawdown(state, equity=100000)
+    mgr.check_total_drawdown(state, equity=105000)
+    mgr.check_total_drawdown(state, equity=102000)
+    assert state.peak_equity == 105000
+
+
+def test_total_drawdown_warns_at_50_and_80_once(caplog):
+    mgr = _manager(max_total_drawdown_pct=10.0, drawdown_basis="starting")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        mgr.check_total_drawdown(state, equity=95000)  # 50%
+        mgr.check_total_drawdown(state, equity=95000)  # repeat: no second log
+        mgr.check_total_drawdown(state, equity=92000)  # 80%
+        mgr.check_total_drawdown(state, equity=92000)  # repeat: no second log
+    warnings = [r.message for r in caplog.records if "drawdown" in r.message.lower()]
+    assert len(warnings) == 2
+    assert state.dd_warned_50 is True
+    assert state.dd_warned_80 is True
+
+
+def test_roll_day_does_not_clear_total_drawdown_halt():
+    mgr = _manager(max_total_drawdown_pct=5.0)
+    state = RiskState(day="2026-01-01", day_start_equity=100000, total_drawdown_halted=True,
+                      total_drawdown_reason="total drawdown")
+    mgr.roll_day(state, equity=100000, now=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    assert state.total_drawdown_halted is True
+    assert state.total_drawdown_reason == "total drawdown"
+
+
+def test_can_enter_blocked_by_total_drawdown_halt():
+    mgr = _manager(max_total_drawdown_pct=5.0)
+    state = RiskState(day="2026-01-01", day_start_equity=100000, total_drawdown_halted=True,
+                      total_drawdown_reason="total drawdown")
+    decision = mgr.can_enter(state, equity=100000, account_risk=risk_snapshot())
+    assert not decision.allowed
+
+
+def test_missing_room_halt_blocks_entry_without_flatten():
+    mgr = _manager(missing_room_policy="halt")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.can_enter(
+        state, equity=100000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    )
+    assert not decision.allowed
+    assert not decision.flatten
+
+
+def test_partial_room_is_enough_when_policy_is_halt():
+    """Only a *complete* absence of room figures should fail closed."""
+    mgr = _manager(missing_room_policy="halt")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.can_enter(
+        state, equity=100000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=5000.0)
+    )
+    assert decision.allowed
+
+
+def test_missing_room_bot_only_allows_entry():
+    mgr = _manager(missing_room_policy="bot-only")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.can_enter(
+        state, equity=100000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    )
+    assert decision.allowed
+
+
+def test_missing_room_halt_still_flags_bot_loss():
+    mgr = _manager(missing_room_policy="halt")
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_kill(
+        state, equity=97000, account_risk=risk_snapshot(daily_loss_room=None, max_drawdown_room=None)
+    )
+    assert not decision.allowed
+    assert decision.flatten
 
 
 def test_daily_loss_cap_halts_and_flags_flatten():
@@ -87,8 +210,54 @@ def test_roll_day_resets_counters():
     assert state.halted is False
 
 
+def test_roll_day_warns_when_baseline_is_estimated(caplog):
+    """A baseline taken mid-day (no stored state) is flagged as approximate."""
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=None)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        mgr.roll_day(state, equity=100000, now=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc))
+    assert state.day_start_equity == 100000
+    assert any("baseline" in r.message.lower() for r in caplog.records)
+
+
+def test_roll_day_does_not_warn_when_baseline_is_known(caplog):
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    with caplog.at_level(logging.WARNING, logger="mfpbot.risk"):
+        mgr.roll_day(state, equity=100100, now=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc))
+    assert not any("baseline" in r.message.lower() for r in caplog.records)
+
+
 def test_allows_when_everything_is_healthy():
     mgr = _manager()
     state = RiskState(day="2026-01-01", day_start_equity=100000)
     decision = mgr.can_open(state, equity=100500, account_risk=risk_snapshot())
     assert decision.allowed
+
+
+def test_check_kill_flags_bot_daily_loss():
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_kill(state, equity=97000, account_risk=risk_snapshot())
+    assert not decision.allowed
+    assert decision.flatten
+
+
+def test_check_kill_flags_room_floor():
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    decision = mgr.check_kill(state, equity=100000, account_risk=risk_snapshot(daily_loss_room=100.0))
+    assert not decision.allowed
+    assert decision.flatten
+
+
+def test_can_enter_ignores_loss_but_honours_trade_limit():
+    mgr = _manager()
+    state = RiskState(day="2026-01-01", day_start_equity=100000)
+    # A large loss does not block entry by itself; that is check_kill's job.
+    assert mgr.can_enter(state, equity=90000, account_risk=risk_snapshot()).allowed
+    mgr.record_entry(state)
+    mgr.record_entry(state)
+    decision = mgr.can_enter(state, equity=100000, account_risk=risk_snapshot())
+    assert not decision.allowed
+    assert "limit" in decision.reason

@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 
+import mfpbot.bot as bot_module
 from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
-from mfpbot.state import BotState
+from mfpbot.risk.manager import RiskState, _utc_day
+from mfpbot.state import BotState, PendingEntry, load_state, save_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
+
+
+class _FakeStream:
+    """A stream that yields the given candles once and then ends."""
+
+    def __init__(self, candles):
+        self._candles = candles
+
+    async def candles(self):
+        for candle in self._candles:
+            yield candle
+
 
 # Downtrend that turns up: bullish EMA cross on the final candle.
 UP_CLOSES = [100.0, 95.0, 90.0, 85.0, 80.0, 81.0, 95.0]
@@ -22,8 +39,8 @@ def scale(closes, mid):
     return [round(c * factor, 4) for c in closes]
 
 
-def build_bot(stub_server, tmp_path, symbols=None, **overrides):
-    base_url, state = stub_server
+def build_bot(stub_server, tmp_path, symbols=None, state=None, clock=None, **overrides):
+    base_url, stub = stub_server
     cfg = Config(
         api_key="fp_test_abc",
         environment="sandbox",
@@ -49,16 +66,18 @@ def build_bot(stub_server, tmp_path, symbols=None, **overrides):
         setattr(cfg, key, value)
     cfg.validate()
     client = MfpClient(cfg.api_key, base_url, sleep=lambda _s: None)
-    bot = Bot(cfg, client=client, state=BotState())
+    bot = Bot(cfg, client=client, state=state if state is not None else BotState())
     bot.account = client.get_account("acct-1")
     bot.resolve_markets()
     bot.risk = bot._build_risk_manager()
-    return bot, state
+    if clock is not None:
+        bot.clock = clock
+    return bot, stub
 
 
-def feed(bot, market_id, closes):
+def feed(bot, market_id, closes, **kwargs):
     symbol = bot.markets[market_id]["coin"]
-    for candle in make_candles(closes, symbol=symbol):
+    for candle in make_candles(closes, symbol=symbol, **kwargs):
         bot.series[market_id].add(candle)
     return bot.series[market_id].closed[-1]
 
@@ -238,6 +257,814 @@ def test_stale_quote_skips_entry(stub_server, tmp_path):
     )
     bot.on_closed_candle("binance|BTCUSDT", bot.series["binance|BTCUSDT"].closed[-1])
     assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def _feed_fresh_cross(bot, market_id, closes, *, now_ms):
+    symbol = bot.markets[market_id]["coin"]
+    start = now_ms - len(closes) * 60_000
+    candles = make_candles(closes, start_time=start, symbol=symbol)
+    for candle in candles:
+        bot._process_candle(market_id, candle)
+
+
+def test_lost_order_response_is_reconciled(stub_server, tmp_path):
+    """An order accepted but with a lost reply must still be owned and counted."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    # The client may retry the POST; the exchange must still create one order.
+    assert len(state.orders) == 1
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.owned_position_ids == ["pos-1"]
+    assert bot.state.pending_entries == {}
+
+
+def test_unknown_order_blocks_entry_without_duplicate(stub_server, tmp_path):
+    """When the reply and the lookup both fail, block the market, never re-order."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert len(state.orders) == 1
+    assert bot.state.pending_entries != {}
+    assert bot.state.risk.entries_today == 0
+    assert bot.state.owned_position_ids == []
+
+    # A later signal in the same market must not fire a second order.
+    now2 = now_ms + 60_000
+    bot.clock = lambda: now2 / 1000.0
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(DOWN_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now2
+    )
+    assert len(state.orders) == 1
+
+
+def test_pending_entry_is_reconciled_on_later_candle(stub_server, tmp_path):
+    """Once the lookup recovers, a pending entry is adopted exactly once."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 10  # exhaust the client's retries this candle
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert bot.state.pending_entries != {}
+    assert bot.state.risk.entries_today == 0
+
+    # The lookup recovers; the next candle reconciles the outstanding entry.
+    state.fail_order_lookup_times = 0
+    now2 = now_ms + 60_000
+    bot.clock = lambda: now2 / 1000.0
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now2
+    )
+
+    assert len(state.orders) == 1
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.owned_position_ids == ["pos-1"]
+    assert bot.state.pending_entries == {}
+
+
+def test_unconfirmed_entry_in_one_market_blocks_another_market(stub_server, tmp_path):
+    """An unresolved entry in market A must not be clobbered by an entry in B."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(
+        stub_server, tmp_path, symbols=["binance|BTCUSDT", "binance|ETHUSDT"],
+        clock=lambda: now_ms / 1000.0,
+    )
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99  # BTC order stays unconfirmed
+
+    # Market A sends an entry whose reply and lookup both fail.
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert len(state.orders) == 1
+    pending_btc = list(bot.state.pending_entries)
+
+    # Market B has a fresh signal, but A is unresolved: B must not open.
+    _feed_fresh_cross(
+        bot, "binance|ETHUSDT", scale(UP_CLOSES, QUOTES["binance|ETHUSDT"]), now_ms=now_ms
+    )
+    assert len(state.orders) == 1
+    assert list(bot.state.pending_entries) == pending_btc
+    assert not any(o.get("market_id") == "binance|ETHUSDT" for o in state.orders)
+
+    # Once A's lookup recovers, A is adopted and the block lifts.
+    state.fail_order_lookup_times = 0
+    now2 = now_ms + 60_000
+    bot.clock = lambda: now2 / 1000.0
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now2
+    )
+    assert bot.state.pending_entries == {}
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.owned_position_ids == ["pos-1"]
+
+
+def test_halted_watchdog_reconciles_pending_entry(stub_server, tmp_path):
+    """A kill while an entry is unconfirmed must still resolve it (no candle).
+
+    The halted branch of the watchdog has to reconcile the pending entry before
+    deciding whether anything is left to flatten; otherwise the position opened
+    by that in-flight order is stranded until the next candle (up to 15m).
+    """
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99  # the entry cannot be confirmed yet
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert len(state.orders) == 1
+    assert list(bot.state.pending_entries) != []
+    assert bot.state.owned_position_ids == []
+
+    # The kill fires on the next watchdog tick; the lookup also recovers.
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    state.fail_order_lookup_times = 0
+
+    for _ in range(50):
+        bot.check_kill_now()
+        if bot.state.pending_entries == {} and bot.state.owned_position_ids == []:
+            break
+
+    assert bot.state.pending_entries == {}
+    assert bot.state.owned_position_ids == []
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert bot.state.risk.halted
+
+
+def test_halted_watchdog_survives_a_failing_pending_lookup(stub_server, tmp_path):
+    """While the lookup still fails, the watchdog must not crash or re-order."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 1_000_000  # stays unconfirmable
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)
+
+    for _ in range(20):
+        bot.check_kill_now()  # must not raise
+
+    assert len(state.orders) == 1  # never duplicated
+    assert list(bot.state.pending_entries) != []
+    assert bot.state.risk.halted
+
+
+def test_server_ignoring_filter_never_duplicates_a_live_order(stub_server, tmp_path):
+    """A filter-ignoring server must not make the bot re-place a live order.
+
+    The reply to the entry POST is lost, and the lookup server ignores the
+    client_order_id filter (so the first row is an unrelated order). If the
+    lookup trusted row[0] it would report "not accepted", clear the pending
+    marker, and re-enter on the next signal — a duplicate position on a live
+    account. The whole list must be scanned instead.
+    """
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    # An unrelated pre-existing order that comes back first.
+    state.orders.append({
+        "id": "order-0", "account_id": "acct-1", "market_id": "binance|ETHUSDT",
+        "side": "buy", "size": 0.01, "client_order_id": "someone-else",
+        "status": "filled",
+    })
+    state.drop_order_response = True
+    state.ignore_order_filter = True
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert bot.state.pending_entries == {}
+    assert bot.state.owned_position_ids == ["pos-1"]
+
+    # Feed another fresh crossover: no second (distinct) entry may be sent. The
+    # retried POSTs of the first entry all carry the same idempotency key, so
+    # count distinct client_order_ids, not raw requests.
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms + 60_000
+    )
+    placed = [r for r in state.requests if r["path"] == "/v1/orders" and r["method"] == "POST"]
+    distinct_ids = {r["body"].get("client_order_id") for r in placed}
+    assert len(distinct_ids) == 1
+
+
+def test_pending_entries_survive_restart(stub_server, tmp_path):
+    """Pending entries are persisted and reloaded for reconciliation."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    state.drop_order_response = True
+    state.fail_order_lookup_times = 99
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+    assert len(bot.state.pending_entries) == 1
+
+    reloaded = load_state(str(tmp_path / "state.json"))
+    assert list(reloaded.pending_entries) == list(bot.state.pending_entries)
+
+
+def test_run_offloads_candle_work_to_a_worker_thread(stub_server, tmp_path, monkeypatch):
+    """The blocking REST work must not run on the event-loop thread."""
+    bot, state = build_bot(stub_server, tmp_path)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candles = make_candles(
+        scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+        symbol="BTCUSDT",
+    )
+    stream = _FakeStream(candles)
+    monkeypatch.setattr(
+        bot_module.MarketDataStream, "for_markets", staticmethod(lambda *a, **k: stream)
+    )
+    bot._market_id_for = lambda c: "binance|BTCUSDT"
+    bot.cfg.poll_seconds = 5.0
+
+    seen: dict[str, threading.Thread] = {}
+    original = bot._process_candle
+
+    def wrapped(market_id, c):
+        seen["thread"] = threading.current_thread()
+        return original(market_id, c)
+
+    bot._process_candle = wrapped
+
+    asyncio.run(bot.run())
+
+    assert "thread" in seen
+    assert seen["thread"] is not threading.current_thread()
+    assert len(state.orders) == 1  # the trade still happened
+
+
+def test_entry_allowed_within_atr_drift(stub_server, tmp_path):
+    """A small move off the candle close is fine when ATR gives room."""
+    bot, state = build_bot(stub_server, tmp_path)
+    # candle close 100, ATR 2 -> allowed drift 0.5 * 2 = 1.0 (1%).
+    state.quotes["binance|BTCUSDT"] = 100.6
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, 100.0))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_entry_blocked_beyond_atr_drift_even_under_absolute_cap(stub_server, tmp_path):
+    """Drift wider than the ATR budget is skipped well below the 5% hard cap."""
+    # ATR ~9.9 here, so a 0.05 budget is ~0.49: far tighter than the 5% ceiling.
+    bot, state = build_bot(stub_server, tmp_path, max_entry_drift_atr=0.05)
+    state.quotes["binance|BTCUSDT"] = 101.0  # 1.0 off close, over the ATR budget
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, 100.0))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_entry_blocked_beyond_absolute_drift_cap(stub_server, tmp_path):
+    """The 5% absolute cap still applies when ATR would allow more."""
+    bot, state = build_bot(stub_server, tmp_path, max_entry_drift_atr=10.0)
+    state.quotes["binance|BTCUSDT"] = 110.0  # 10% > 5% hard cap
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, 100.0))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_dry_run_uses_a_separate_state_file(stub_server, tmp_path):
+    """A dry run must neither read nor write the live state file."""
+    base_url, stub = stub_server
+    live = tmp_path / "state.json"
+    save_state(str(live), BotState(risk=RiskState(
+        day=_utc_day(), day_start_equity=100000.0, entries_today=5
+    )))
+
+    cfg = Config(
+        api_key="fp_test_abc", environment="sandbox", account_id="acct-1",
+        symbols=["binance|BTCUSDT"], strategy="ema_cross", timeframe="1m",
+        ema_fast=2, ema_slow=4, atr_period=2, atr_stop_mult=2.0, take_profit_rr=2.0,
+        risk_per_trade_pct=1.0, leverage=2.0, margin_mode="cross", max_daily_trades=6,
+        max_daily_loss_pct=2.0, min_daily_room_pct=0.5,
+        state_file=str(live), dry_run=True,
+    )
+    cfg.validate()
+    client = MfpClient(cfg.api_key, base_url, sleep=lambda _s: None)
+    bot = Bot(cfg, client=client)  # no injected state -> loads from disk
+    bot.account = client.get_account("acct-1")
+    bot.resolve_markets()
+    bot.risk = bot._build_risk_manager()
+
+    assert bot.state.risk.entries_today == 0  # did not read the live file
+
+    candle = feed(bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]))
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert (tmp_path / "state.json.dryrun").exists()
+    assert load_state(str(live)).risk.entries_today == 5  # live file untouched
+
+
+def test_transient_candle_error_is_retried_without_reordering(stub_server, tmp_path, monkeypatch):
+    """A transient REST failure must retry the candle, not skip or double-trade it."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+    state.fail_times["/v1/accounts/acct-1"] = 99  # first attempt fails
+    monkeypatch.setattr(bot_module.time, "sleep", lambda _s: None)
+
+    attempts = {"n": 0}
+    real = bot.on_closed_candle
+
+    def counting(market_id, c):
+        attempts["n"] += 1
+        if attempts["n"] == 2:
+            state.fail_times["/v1/accounts/acct-1"] = 0  # recover on the retry
+        return real(market_id, c)
+
+    monkeypatch.setattr(bot, "on_closed_candle", counting)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    assert attempts["n"] == 2
+    assert len(state.orders) == 1
+    assert bot.state.risk.entries_today == 1
+    assert bot.state.last_processed_open_time["binance|BTCUSDT"] == candle.open_time
+
+
+def test_candle_cursor_not_advanced_when_all_attempts_fail(stub_server, tmp_path, monkeypatch):
+    """A candle must not be marked processed until it is actually handled."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+    state.fail_times["/v1/accounts/acct-1"] = 99  # never recovers
+    monkeypatch.setattr(bot_module.time, "sleep", lambda _s: None)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    assert bot.state.last_processed_open_time.get("binance|BTCUSDT") is None
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def _owned_short(state, market_id="binance|BTCUSDT", position_id="pos-1"):
+    state.positions = [{
+        "id": position_id, "account_id": "acct-1", "market_id": market_id,
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "short",
+        "size": 0.01, "entry_price": 120.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    return [position_id]
+
+
+def test_reversal_adopts_the_new_position_when_close_lags(stub_server, tmp_path):
+    """A closed-but-still-listed old position must not be re-adopted."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    bot.state.owned_position_ids = _owned_short(state)
+    state.slow_close_polls = 2  # the old position lingers for two polls
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert bot.state.owned_position_ids == ["pos-2"]
+
+
+def test_reversal_skips_entry_when_old_position_will_not_close(stub_server, tmp_path):
+    """If the old position will not go away, do not stack a new one on top."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    bot.state.owned_position_ids = _owned_short(state)
+    state.slow_close_polls = 10_000  # never disappears within the wait window
+
+    _feed_fresh_cross(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]), now_ms=now_ms
+    )
+
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+    # The position is still listed, so the bot keeps owning it (no orphan).
+    assert bot.state.owned_position_ids == ["pos-1"]
+
+
+def test_kill_switch_runs_while_holding_a_position(stub_server, tmp_path):
+    """A bot-owned position must not shield the account from the daily kill switch."""
+    bot, state = build_bot(stub_server, tmp_path)
+    state.positions = [{
+        "id": "pos-own", "account_id": "acct-1", "market_id": "binance|BTCUSDT",
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    bot.state.owned_position_ids = ["pos-own"]
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    candle = feed(bot, "binance|BTCUSDT", [100.0] * 12)  # no crossover
+
+    bot.on_closed_candle("binance|BTCUSDT", candle)
+
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+    assert bot.state.risk.halted
+
+
+def test_watchdog_flattens_without_a_new_candle(stub_server, tmp_path):
+    """The poll watchdog enforces the kill switch between candles."""
+    import asyncio
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.05)
+    state.positions = [{
+        "id": "pos-own", "account_id": "acct-1", "market_id": "binance|BTCUSDT",
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    bot.state.owned_position_ids = ["pos-own"]
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        for _ in range(200):
+            if bot.state.risk.halted:
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert bot.state.risk.halted
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+
+
+def _owned_long(state, market_id="binance|BTCUSDT", position_id="pos-own"):
+    state.positions = [{
+        "id": position_id, "account_id": "acct-1", "market_id": market_id,
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    return [position_id]
+
+
+def test_watchdog_flattens_again_after_the_day_rolls_over(stub_server, tmp_path):
+    """The watchdog must keep running after the first kill, not die permanently."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.owned_position_ids = _owned_long(state)
+    bot.state.risk.day = "2026-01-01"
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    clock = {"now": datetime(2026, 1, 1, 23, 59, tzinfo=timezone.utc)}
+    bot._now = lambda: clock["now"]
+
+    async def wait_for(pred, timeout=6.0):
+        for _ in range(int(timeout / 0.02)):
+            if pred():
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        assert await wait_for(lambda: bot.state.risk.halted)
+        assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+
+        # Day 2 opens flat at 100k: the watchdog's own roll_day clears the halt.
+        state.positions = []
+        bot.state.owned_position_ids = []
+        state.risk = risk_snapshot(equity=100000.0)
+        clock["now"] = datetime(2026, 1, 2, 0, 1, tzinfo=timezone.utc)
+        assert await wait_for(lambda: not bot.state.risk.halted)
+
+        # A fresh position and a 3% loss on day 2 must flatten again, no candle.
+        bot.state.owned_position_ids = _owned_long(state, position_id="pos-day2")
+        state.risk = risk_snapshot(equity=97000.0)
+        assert await wait_for(lambda: bot.state.risk.halted)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert any(r["path"] == "/v1/positions/pos-day2/close" for r in state.requests)
+
+
+def test_flatten_retries_until_the_position_is_closed(stub_server, tmp_path, monkeypatch):
+    """A failed close must be retried by the watchdog, not attempted once."""
+    import asyncio
+
+    monkeypatch.setattr(bot_module, "CLOSE_VERIFY_TIMEOUT", 0.2)
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.owned_position_ids = _owned_long(state)
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # kill fires
+    state.fail_close_times = 2  # two rejected closes, then it works
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        for _ in range(400):
+            if bot.state.owned_position_ids == []:
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    closes = [r for r in state.requests if r["path"] == "/v1/positions/pos-own/close"]
+    assert len(closes) >= 3  # retried after the two failures
+    assert state.closed_position_ids == ["pos-own"]
+    assert bot.state.owned_position_ids == []  # no orphaned id
+
+
+def test_close_keeps_ownership_until_the_position_is_gone(stub_server, tmp_path, monkeypatch):
+    """A close that is accepted but not yet effective must keep the id owned."""
+    monkeypatch.setattr(bot_module, "CLOSE_VERIFY_TIMEOUT", 0.2)
+    bot, state = build_bot(stub_server, tmp_path)
+    bot.state.owned_position_ids = _owned_long(state)
+    state.slow_close_polls = 10_000  # close accepted, position lingers
+
+    remaining = bot._flatten()
+
+    assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+    assert bot.state.owned_position_ids == ["pos-own"]
+    assert [p["id"] for p in remaining] == ["pos-own"]
+
+    # Once the exchange drops it, pruning forgets the id.
+    state.slow_close_polls = 0
+    bot._prune_owned(bot._open_positions())
+    assert bot.state.owned_position_ids == []
+
+
+def test_watchdog_idles_without_rest_while_halted_and_flat(stub_server, tmp_path):
+    """A halted bot with no open positions must not hammer the API."""
+    import asyncio
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.risk.halted = True
+    bot.state.risk.halt_reason = "already halted"
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    baseline = len(state.requests)  # setup traffic (account + markets) is expected
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert len(state.requests) == baseline
+
+
+def test_watchdog_kills_promptly_despite_a_slow_candle_handler(stub_server, tmp_path, monkeypatch):
+    """A slow candle handler must not delay the watchdog's kill decision."""
+    import time
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+    # No trade here; only the position listing is slow (the account fetch the
+    # watchdog needs stays fast). The old code held the lock across this listing.
+    monkeypatch.setattr(bot, "_open_from_signal", lambda *a, **k: None)
+    state.slow_paths = {"/v1/positions": 1.0}
+
+    handler = threading.Thread(target=bot._process_candle, args=("binance|BTCUSDT", candle))
+    handler.start()
+    time.sleep(0.3)  # the handler is now mid-listing
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+
+    started = time.monotonic()
+    fired = bot.check_kill_now()
+    elapsed = time.monotonic() - started
+    handler.join(timeout=10)
+
+    assert fired
+    assert elapsed < 0.5, f"watchdog waited {elapsed:.2f}s for a slow candle handler"
+    assert bot.state.risk.halted
+
+
+def test_entry_not_sent_after_halt_during_a_slow_entry(stub_server, tmp_path, monkeypatch):
+    """A halt that lands mid-entry must stop the order from being sent."""
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+
+    # Simulate the watchdog halting the bot while the handler is between its
+    # signal and the order POST.
+    def halt_then_continue(market_id, side, size, entry, stop, tp):
+        bot.state.risk.halted = True
+        bot.state.risk.halt_reason = "race"
+        return bot._place_entry_original(market_id, side, size, entry, stop, tp)
+
+    bot._place_entry_original = bot._place_entry
+    monkeypatch.setattr(bot, "_place_entry", halt_then_continue)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_fill_after_halt_is_flattened(stub_server, tmp_path, monkeypatch):
+    """An entry already in flight when the kill fires is closed, not orphaned."""
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candle = feed(
+        bot, "binance|BTCUSDT", scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+    )
+
+    def halt_before_fill(market_id, created, pending):
+        bot.state.risk.halted = True
+        bot.state.risk.halt_reason = "race"
+        return bot._finish_entry_original(market_id, created, pending)
+
+    bot._finish_entry_original = bot._finish_entry
+    monkeypatch.setattr(bot, "_finish_entry", halt_before_fill)
+
+    bot._process_candle("binance|BTCUSDT", candle)
+
+    # The position opened by the in-flight order was closed by the flatten.
+    assert any(r["path"] == "/v1/positions/pos-1/close" for r in state.requests)
+    assert bot.state.owned_position_ids == []
+
+
+def test_entry_aborted_when_position_snapshot_fails(stub_server, tmp_path):
+    """A failed pre-entry snapshot must abort the entry, not risk adopting a
+    manual position as if it were ours."""
+    bot, state = build_bot(stub_server, tmp_path)
+    state.fail_times["/v1/positions?account_id=acct-1&status=open"] = 999
+
+    result = bot._place_entry("binance|BTCUSDT", "buy", 0.01, 100.0, 98.0, 104.0)
+
+    assert result is None
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+    assert bot.state.pending_entries == {}
+
+
+def test_candle_older_than_one_interval_is_not_traded(stub_server, tmp_path):
+    """A candle that closed more than one interval ago is history, not a signal."""
+    bot, state = build_bot(stub_server, tmp_path)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    # The final candle closes 1.5 intervals before "now": must be skipped.
+    closes = scale(UP_CLOSES, QUOTES["binance|BTCUSDT"])
+    start = now_ms - 150_000 - (len(closes) - 1) * 60_000
+    for candle in make_candles(closes, start_time=start, symbol="BTCUSDT"):
+        bot._process_candle("binance|BTCUSDT", candle)
+
+    assert not any(r["path"] == "/v1/orders" for r in state.requests)
+
+
+def test_kill_check_does_not_wait_for_pending_reconcile(stub_server, tmp_path):
+    """The kill must fire even while an order lookup is slow/pending."""
+    import time
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.pending_entries["mfpbot:binance|BTCUSDT:abc"] = PendingEntry(
+        market_id="binance|BTCUSDT",
+        client_order_id="mfpbot:binance|BTCUSDT:abc",
+        idempotency_key="idem-1",
+        sent_at=0.0,
+        pre_position_ids=[],
+    )
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    state.slow_paths = {"/v1/orders": 1.0}
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+
+    started = time.monotonic()
+    fired = bot.check_kill_now()
+    elapsed = time.monotonic() - started
+
+    assert fired
+    assert elapsed < 0.5, f"kill waited {elapsed:.2f}s on the pending reconcile"
+    assert bot.state.risk.halted
+
+
+def test_non_terminal_order_keeps_pending_entry(stub_server, tmp_path, monkeypatch):
+    """An order still working after the wait stays pending (never dropped)."""
+    bot, state = build_bot(stub_server, tmp_path)
+    pending = PendingEntry(
+        market_id="binance|BTCUSDT", client_order_id="coid-1",
+        idempotency_key="idem-1", sent_at=0.0, pre_position_ids=[],
+    )
+    bot.state.pending_entries["coid-1"] = pending
+    monkeypatch.setattr(bot, "_await_order", lambda *a, **k: {"id": "order-1", "status": "new"})
+
+    filled, resolved = bot._finish_entry(
+        "binance|BTCUSDT", {"id": "order-1", "status": "new"}, pending
+    )
+
+    assert filled is None
+    assert resolved is False
+    assert "coid-1" in bot.state.pending_entries
+
+
+def test_history_replay_is_not_traded(stub_server, tmp_path):
+    """300 historical candles with a crossover inside must not trade."""
+    bot, state = build_bot(stub_server, tmp_path)
+    # A long history whose last-but-one candle crosses; all of it is old.
+    closes = [100.0] * 290 + [95.0, 90.0, 85.0, 80.0, 81.0, 95.0]
+    history = make_candles(closes, symbol="BTCUSDT")
+    for candle in history:
+        bot.series["binance|BTCUSDT"].add(candle)
+        bot._process_candle("binance|BTCUSDT", candle)
+
+    orders = [r for r in state.requests if r["path"] == "/v1/orders"]
+    accounts = [r for r in state.requests if r["path"] == "/v1/accounts/acct-1"]
+    assert orders == []
+    assert len(accounts) <= 2
+    assert bot.state.risk.entries_today == 0
+
+
+def test_fresh_candle_after_history_still_trades(stub_server, tmp_path):
+    """A fresh crossing candle is evaluated once the history is behind us."""
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot, state = build_bot(stub_server, tmp_path, clock=lambda: now_ms / 1000.0)
+    closes = scale([100.0] * 290 + [95.0, 90.0, 85.0, 80.0, 81.0, 95.0], QUOTES["binance|BTCUSDT"])
+    start = now_ms - len(closes) * 60_000
+    history = make_candles(closes, start_time=start, symbol="BTCUSDT")
+    for candle in history[:-1]:
+        bot._process_candle("binance|BTCUSDT", candle)
+    fresh = history[-1]
+    assert fresh.close_time >= now_ms - 60_000
+    bot._process_candle("binance|BTCUSDT", fresh)
+
+    orders = [r for r in state.requests if r["path"] == "/v1/orders"]
+    assert len(orders) == 1
+
+
+def test_restart_does_not_reprocess_last_candle(stub_server, tmp_path):
+    """A restart with a persisted cursor skips already-seen candles."""
+    cursor = 1_700_000_000_000 + 6 * 60_000
+    saved = BotState(last_processed_open_time={"binance|BTCUSDT": cursor})
+    now_ms = cursor + 60_000 + 1000
+    bot, state = build_bot(
+        stub_server, tmp_path, state=saved, clock=lambda: now_ms / 1000.0
+    )
+    closes = [100.0] * 290 + [95.0, 90.0, 85.0, 80.0, 81.0, 95.0]
+    start = cursor - (len(closes) - 1) * 60_000
+    for candle in make_candles(closes, start_time=start, symbol="BTCUSDT"):
+        bot._process_candle("binance|BTCUSDT", candle)
+
+    orders = [r for r in state.requests if r["path"] == "/v1/orders"]
+    assert orders == []
+    assert bot.state.risk.entries_today == 0
 
 
 def test_market_id_mapping(stub_server, tmp_path):

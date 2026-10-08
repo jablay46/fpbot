@@ -12,9 +12,11 @@ risk budget, and places orders with broker-side TP/SL.
 
 ## Environment and commands
 
-* Python 3.10+ (developed on 3.13). Dependencies: `requests`, `websockets`,
-  `python-dotenv`; tests use `pytest`.
+* Python 3.10+ (developed on 3.13). Dependencies: `requests`, `websockets`
+  (pinned in `requirements.txt`); tests use `pytest` and `pip-audit`
+  (`requirements-dev.txt`).
 * Install: `pip install -r requirements-dev.txt`
+* Audit dependencies: `pip-audit -r requirements.txt`
 * Run tests: `python -m pytest -q` (tests use a local HTTP stub server, no
   network and no API key required).
 * Discover markets: `python -m mfpbot markets`
@@ -55,6 +57,21 @@ risk budget, and places orders with broker-side TP/SL.
 * The API is in **beta**; breaking changes are possible.
 * REST only covers trading on existing accounts. Signup, purchases, payouts,
   and API-key creation are website-only (and intentionally not automated here).
+* **Verified live (2026-10-08):** `GET /v1/orders?client_order_id=...` filters
+  server-side (a bogus id returns `data: []`), and the returned `Order` echoes
+  the `client_order_id` *only when it was supplied at placement* (orders placed
+  by hand on the website carry `client_order_id: null`). `find_order_by_client_id`
+  therefore verifies the field on the returned order and treats a mismatch as
+  "not found". The lookup scans the *whole* returned list (paging via the
+  cursor) rather than trusting row[0], and retries without the filter if the
+  filtered reply is empty — a server that ignores the filter must never hide a
+  live, in-flight entry (which the bot would re-place as a duplicate).
+  `close_position` is a blocking POST that returns an ack; execution
+  is asynchronous, so the caller confirms via `_wait_position_gone`.
+* **Verified live (2026-10-08):** the candle WebSocket snapshot arrives with
+  `isFinal: true` for completed history bars and `isFinal: false` for the
+  forming bar (repeated on each update). `Candle.from_event` reads `isFinal`,
+  and `_process_candle` ignores non-final bars.
 
 ## Conventions
 
@@ -74,9 +91,37 @@ risk budget, and places orders with broker-side TP/SL.
 * A competition account's risk snapshot may report `daily_loss_room` and
   `max_drawdown_room` as `null`; the guards treat `null` as "no limit", so the
   bot-side daily caps are the effective protection there.
+* **Verified on the live $100k challenge account (2026-10-08):** `GET
+  /v1/accounts/{id}` returns `daily_loss_room=null`, `max_drawdown_room=null`,
+  and `requirements.{daily_loss_pct,max_drawdown_pct,profit_target_pct}=0`
+  (the account's `trading-policy` rules all carry `pct: 0`). With the default
+  `FP_ON_MISSING_ROOM=halt`, the bot therefore **refuses every entry** on this
+  account. Trading it requires `FP_ON_MISSING_ROOM=bot-only`, which leaves only
+  the bot-side caps (`FP_MAX_DAILY_LOSS_PCT`, `FP_MAX_DAILY_TRADES`) as
+  protection. `GET /v1/accounts/{id}/trading-policy` is available if the firm
+  later exposes real rule percentages.
 * `save_state` must never raise — a failed write logs and degrades to a direct
   write, because a state-file error must not kill the trading loop.
 * Tests must exercise real code paths. `tests/conftest.py` starts a real
   `ThreadingHTTPServer` stub; do not replace it with mocks.
 * Never log or commit API keys. The live key lives only in `.env` (git-ignored,
-  mode 600); load it with `load_dotenv_file()` from `mfpbot.config`.
+  mode 600); `load_dotenv_file()` from `mfpbot.config` parses it with the
+  standard library (no `python-dotenv` dependency).
+* A dry run uses `<FP_STATE_FILE>.dryrun` (`Config.state_path`) so it never
+  reads or writes live state.
+* Entry drift is capped at `min(5% of close, FP_MAX_ENTRY_DRIFT_ATR * ATR)`.
+* **Concurrency rule:** never hold `Bot._lock` across network I/O. The candle
+  handler makes blocking REST calls off the event loop; holding the lock across
+  them would stall the watchdog's kill check. The halt flag is set under a short
+  lock (no I/O) and the flatten runs outside it, guarded by `_flatten_lock`.
+  A kill that lands mid-entry stops the order (`_place_entry` re-checks
+  `halted` under the lock); a fill that still arrives after a halt is flattened
+  by `_finish_entry`.
+* **Pending entries:** `BotState.pending_entries` is a dict keyed by
+  `client_order_id`, never a single slot. A pending marker is cleared only when
+  the order reaches a terminal state; a still-working order stays pending so the
+  lookup is retried instead of risking a duplicate.
+* **Ownership is released only on confirmation:** `_close_position` does not
+  forget the id on submit; `_prune_owned`/`_flatten` drop it once the exchange
+  reports the position gone. The flatten verifies the result and the watchdog
+  retries it every tick while halted.
