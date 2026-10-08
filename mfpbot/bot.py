@@ -13,12 +13,13 @@ import logging
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .client import ApiError, MfpClient
 from .config import Config
 from .market_stream import Candle, CandleSeries, MarketDataStream
-from .risk.manager import RiskManager, RiskState
+from .risk.manager import RiskManager, RiskState, _utc_day
 from .risk.sizing import PositionSizer
 from .state import BotState, PendingEntry, load_state, save_state
 from .strategy import build_strategy
@@ -65,6 +66,8 @@ class Bot:
         self._rotation = 0
         # Injectable wall clock (seconds) so tests can control candle freshness.
         self.clock = time.time
+        # Injectable UTC clock for the daily guard / day rollover.
+        self._now = lambda: datetime.now(timezone.utc)
         self._interval_ms = parse_interval_ms(config.timeframe)
         # Serializes account/position/state mutation between the candle worker
         # thread (P6 offloads the blocking REST work) and the poll watchdog.
@@ -404,7 +407,7 @@ class Bot:
             raise SystemExit(0)
 
         equity = self._equity(account_risk)
-        self.risk.roll_day(self.state.risk, equity)
+        self.risk.roll_day(self.state.risk, equity, now=self._now())
 
         # The account kill switch must run before the position branch: a
         # bot-owned position must never stop the daily loss / room floor guard
@@ -582,16 +585,21 @@ class Bot:
     def check_kill_now(self) -> bool:
         """Run the account kill switch once, independently of candles.
 
-        Returns True when the kill switch fired (flatten + halt). Safe to call
-        from any thread; state mutation is serialized by ``self._lock``.
+        Returns True when the bot is (or becomes) halted. Safe to call from any
+        thread; state mutation is serialized by ``self._lock``.
+
+        While halted the watchdog stays quiet (no REST) unless the UTC day has
+        changed, in which case ``roll_day`` clears the halt so the new day is
+        guarded like any other. A watchdog that stopped after the first kill
+        would silently leave the account unprotected on the following day.
         """
         with self._lock:
-            if self.state.risk.halted:
+            if self.state.risk.halted and self.state.risk.day == _utc_day(self._now()):
                 return True
             self._reconcile_pending_entry()
             account_risk = self._refresh_account()
             equity = self._equity(account_risk)
-            self.risk.roll_day(self.state.risk, equity)
+            self.risk.roll_day(self.state.risk, equity, now=self._now())
             kill = self.risk.check_kill(self.state.risk, equity, account_risk)
             if kill.allowed:
                 return False
@@ -603,8 +611,14 @@ class Bot:
             return True
 
     async def _watchdog(self) -> None:
-        """Poll the account between candles so guards fire even with no signal."""
+        """Poll the account between candles so guards fire even with no signal.
+
+        Runs for the whole life of the bot: a kill on one day must not disable
+        the watchdog for the next. Logs the active-kill state once per day
+        instead of on every tick.
+        """
         interval = max(self.cfg.poll_seconds, 0.05)
+        announced_day: Optional[str] = None
         while True:
             await asyncio.sleep(interval)
             try:
@@ -612,9 +626,12 @@ class Bot:
             except Exception as exc:  # noqa: BLE001 - watchdog must not die
                 log.warning("watchdog check failed: %s", exc)
                 continue
-            if fired:
-                log.warning("watchdog: kill switch active; stopping checks")
-                return
+            day = _utc_day(self._now())
+            if fired and announced_day != day:
+                log.warning("watchdog: kill switch active; guarding until the day rolls over")
+                announced_day = day
+            elif not fired:
+                announced_day = None
 
     # -- run loop ---------------------------------------------------------
 

@@ -579,6 +579,88 @@ def test_watchdog_flattens_without_a_new_candle(stub_server, tmp_path):
     assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
 
 
+def _owned_long(state, market_id="binance|BTCUSDT", position_id="pos-own"):
+    state.positions = [{
+        "id": position_id, "account_id": "acct-1", "market_id": market_id,
+        "provider": "binance", "symbol": "BTC", "coin": "BTCUSDT", "side": "long",
+        "size": 0.01, "entry_price": 100.0, "leverage": 2.0, "margin_mode": "cross",
+        "status": "open", "opened_at": 1,
+    }]
+    return [position_id]
+
+
+def test_watchdog_flattens_again_after_the_day_rolls_over(stub_server, tmp_path):
+    """The watchdog must keep running after the first kill, not die permanently."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.owned_position_ids = _owned_long(state)
+    bot.state.risk.day = "2026-01-01"
+    bot.state.risk.day_start_equity = 100000.0
+    state.risk = risk_snapshot(equity=96000.0)  # -4% vs the 2% cap
+    clock = {"now": datetime(2026, 1, 1, 23, 59, tzinfo=timezone.utc)}
+    bot._now = lambda: clock["now"]
+
+    async def wait_for(pred, timeout=6.0):
+        for _ in range(int(timeout / 0.02)):
+            if pred():
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        assert await wait_for(lambda: bot.state.risk.halted)
+        assert any(r["path"] == "/v1/positions/pos-own/close" for r in state.requests)
+
+        # Day 2 opens flat at 100k: the watchdog's own roll_day clears the halt.
+        state.positions = []
+        bot.state.owned_position_ids = []
+        state.risk = risk_snapshot(equity=100000.0)
+        clock["now"] = datetime(2026, 1, 2, 0, 1, tzinfo=timezone.utc)
+        assert await wait_for(lambda: not bot.state.risk.halted)
+
+        # A fresh position and a 3% loss on day 2 must flatten again, no candle.
+        bot.state.owned_position_ids = _owned_long(state, position_id="pos-day2")
+        state.risk = risk_snapshot(equity=97000.0)
+        assert await wait_for(lambda: bot.state.risk.halted)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert any(r["path"] == "/v1/positions/pos-day2/close" for r in state.requests)
+
+
+def test_watchdog_idles_without_rest_while_halted_and_flat(stub_server, tmp_path):
+    """A halted bot with no open positions must not hammer the API."""
+    import asyncio
+
+    bot, state = build_bot(stub_server, tmp_path, poll_seconds=0.02)
+    bot.state.risk.halted = True
+    bot.state.risk.halt_reason = "already halted"
+    bot.state.risk.day = _utc_day()
+    bot.state.risk.day_start_equity = 100000.0
+    baseline = len(state.requests)  # setup traffic (account + markets) is expected
+
+    async def scenario():
+        task = asyncio.create_task(bot._watchdog())
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert len(state.requests) == baseline
+
+
 def test_history_replay_is_not_traded(stub_server, tmp_path):
     """300 historical candles with a crossover inside must not trade."""
     bot, state = build_bot(stub_server, tmp_path)
