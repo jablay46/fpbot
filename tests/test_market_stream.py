@@ -33,6 +33,7 @@ def test_for_markets_deduplicates_coins():
     ]
     stream = MarketDataStream.for_markets("wss://example", markets)
     assert stream.groups == [{"symbols": ["BTCUSDT"], "providers": ["binance"]}]
+    assert stream.interval == "4h"
 
 
 def test_candle_series_keeps_last_and_forming():

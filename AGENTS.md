@@ -149,6 +149,14 @@ risk budget, and places orders with broker-side TP/SL.
   of cost. The loader refuses multi-symbol/interval datasets (`load_many`
   merges same-market shards only); the archiver dedups by
   `(provider, symbol, interval, open_time)`.
+* **Defaults:** `FP_STRATEGY=donchian_breakout` and `FP_TIMEFRAME=4h`. On real
+  MFP candles (public `candles.history`) 15m is net-negative for every shipped
+  strategy - gross, not just after costs - while 4h gives donchian a positive
+  walk-forward edge (BTC MAR 0.73, PF 1.19, 100% folds; ETH PF 1.17). Keep the
+  two in sync: the live stream interval (`Config.timeframe`), the `archive`
+  CLI default and `MarketDataStream`'s default are all `4h`. Breakeven and
+  trailing (`FP_BREAKEVEN_AT_R`, `FP_TRAIL_ATR_MULT`) stay off by default -
+  enable per market only when a backtest shows they help.
 * Risk guards live in `mfpbot/risk/`. Two layers: bot-side daily caps and
   account-side room from the API risk snapshot. `RiskState` also lives in
   `mfpbot/state.py` alongside the persisted `BotState`. The daily boundary is

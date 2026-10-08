@@ -140,7 +140,7 @@ class MarketDataStream:
         url: str,
         *,
         groups: list[dict],
-        interval: str = "15m",
+        interval: str = "4h",
         history_limit: int = 300,
         max_backoff: float = 60.0,
         ping_interval: float = 20.0,
@@ -168,7 +168,7 @@ class MarketDataStream:
         url: str,
         markets: list[dict],
         *,
-        interval: str = "15m",
+        interval: str = "4h",
         history_limit: int = 300,
         max_backoff: float = 60.0,
     ) -> "MarketDataStream":

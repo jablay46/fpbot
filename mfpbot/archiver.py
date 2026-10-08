@@ -8,7 +8,7 @@ skips bars already written, so it is safe to start, stop and resume.
 Run it alongside the bot (or on its own) to build the dataset, then point the
 backtester at the file:
 
-    python -m mfpbot archive --symbols binance|BTCUSDT --timeframe 15m --out btc.jsonl
+    python -m mfpbot archive --symbols binance|BTCUSDT --timeframe 4h --out btc.jsonl
     python -m mfpbot backtest --bars btc.jsonl --strategy donchian_breakout
 """
 

@@ -19,6 +19,14 @@ def test_defaults_and_env_override():
     assert cfg.ema_fast == 5
 
 
+def test_default_strategy_and_timeframe_are_the_validated_pair():
+    # 4h + donchian_breakout is the combination shown to be net-positive on
+    # real MFP candles; 15m is net-negative for every shipped strategy.
+    cfg = load_config(env={"FP_API_KEY": "fp_test_abc"}, require_key=True)
+    assert cfg.strategy == "donchian_breakout"
+    assert cfg.timeframe == "4h"
+
+
 def test_missing_key_rejected_when_required():
     with pytest.raises(ConfigError):
         load_config(env={}, require_key=True)
