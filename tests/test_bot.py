@@ -2,14 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 
+import mfpbot.bot as bot_module
 from mfpbot.bot import Bot
 from mfpbot.client import MfpClient
 from mfpbot.config import Config
 from mfpbot.risk.manager import _utc_day
 from mfpbot.state import BotState, PendingEntry, load_state
 from tests.conftest import MARKET, MARKET_ETH, QUOTES, risk_snapshot, make_candles
+
+
+class _FakeStream:
+    """A stream that yields the given candles once and then ends."""
+
+    def __init__(self, candles):
+        self._candles = candles
+
+    async def candles(self):
+        for candle in self._candles:
+            yield candle
+
 
 # Downtrend that turns up: bullish EMA cross on the final candle.
 UP_CLOSES = [100.0, 95.0, 90.0, 85.0, 80.0, 81.0, 95.0]
@@ -318,6 +334,39 @@ def test_pending_entry_is_reconciled_on_later_candle(stub_server, tmp_path):
     assert bot.state.risk.entries_today == 1
     assert bot.state.owned_position_ids == ["pos-1"]
     assert bot.state.pending_entry is None
+
+
+def test_run_offloads_candle_work_to_a_worker_thread(stub_server, tmp_path, monkeypatch):
+    """The blocking REST work must not run on the event-loop thread."""
+    bot, state = build_bot(stub_server, tmp_path)
+    now_ms = 1_700_000_000_000 + 1000 * 60_000
+    bot.clock = lambda: now_ms / 1000.0
+    candles = make_candles(
+        scale(UP_CLOSES, QUOTES["binance|BTCUSDT"]),
+        start_time=now_ms - 7 * 60_000,
+        symbol="BTCUSDT",
+    )
+    stream = _FakeStream(candles)
+    monkeypatch.setattr(
+        bot_module.MarketDataStream, "for_markets", staticmethod(lambda *a, **k: stream)
+    )
+    bot._market_id_for = lambda c: "binance|BTCUSDT"
+    bot.cfg.poll_seconds = 5.0
+
+    seen: dict[str, threading.Thread] = {}
+    original = bot._process_candle
+
+    def wrapped(market_id, c):
+        seen["thread"] = threading.current_thread()
+        return original(market_id, c)
+
+    bot._process_candle = wrapped
+
+    asyncio.run(bot.run())
+
+    assert "thread" in seen
+    assert seen["thread"] is not threading.current_thread()
+    assert len(state.orders) == 1  # the trade still happened
 
 
 def _owned_short(state, market_id="binance|BTCUSDT", position_id="pos-1"):

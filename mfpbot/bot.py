@@ -64,9 +64,10 @@ class Bot:
         # Injectable wall clock (seconds) so tests can control candle freshness.
         self.clock = time.time
         self._interval_ms = parse_interval_ms(config.timeframe)
-        # Serializes account/position/state mutation between the candle loop and
-        # the poll watchdog, which run on different threads.
-        self._lock = threading.Lock()
+        # Serializes account/position/state mutation between the candle worker
+        # thread (P6 offloads the blocking REST work) and the poll watchdog.
+        # Reentrant so a locked section may call helpers that also lock.
+        self._lock = threading.RLock()
 
     # -- setup ------------------------------------------------------------
 
@@ -653,7 +654,9 @@ class Bot:
                 if market_id is None:
                     continue
                 try:
-                    self._process_candle(market_id, candle)
+                    # REST calls and backoff sleeps block; run them off the event
+                    # loop so the WebSocket pump and heartbeat keep flowing.
+                    await asyncio.to_thread(self._process_candle, market_id, candle)
                 except SystemExit:
                     return
                 except Exception as exc:  # noqa: BLE001 - one bad candle must not kill the bot
@@ -669,19 +672,20 @@ class Bot:
         and advance the cursor, but they never make REST calls or place orders —
         otherwise backfilled crossovers would trade on startup.
         """
-        self.series[market_id].add(candle)
-        if not candle.is_final:
-            return
-        last = self.state.last_processed_open_time.get(market_id)
-        if last is not None and candle.open_time <= last:
-            return
-        if not self._is_fresh(candle):
+        with self._lock:
+            self.series[market_id].add(candle)
+            if not candle.is_final:
+                return
+            last = self.state.last_processed_open_time.get(market_id)
+            if last is not None and candle.open_time <= last:
+                return
+            if not self._is_fresh(candle):
+                self.state.last_processed_open_time[market_id] = candle.open_time
+                return
+            self.on_closed_candle(market_id, candle)
             self.state.last_processed_open_time[market_id] = candle.open_time
-            return
-        self.on_closed_candle(market_id, candle)
-        self.state.last_processed_open_time[market_id] = candle.open_time
-        self._rotation += 1
-        save_state(self.cfg.state_file, self.state)
+            self._rotation += 1
+            save_state(self.cfg.state_file, self.state)
 
     def _is_fresh(self, candle: Candle) -> bool:
         """True when the candle closed recently enough to act on."""
